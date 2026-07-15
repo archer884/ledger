@@ -1,0 +1,15 @@
+[package]
+name = "ledger"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4", features = ["derive", "env", "wrap_help"] }
+crossterm = "0.28"
+dirs = "5"
+jiff = "0.1"
+ratatui = "0.28"
+rusqlite = { version = "0.32", features = ["bundled"] }
+rust_decimal = "1"
+thiserror = "1"
+ulid = "1"
