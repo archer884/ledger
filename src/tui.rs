@@ -11,14 +11,16 @@ use jiff::civil::Date;
 use jiff::tz::TimeZone;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Cell, Paragraph, Row, Table, TableState};
+use ratatui::widgets::{
+    Block, BorderType, Borders, Cell, Clear, Paragraph, Row, Table, TableState,
+};
 use rust_decimal::Decimal;
 use thiserror::Error;
 
-use crate::model::{Account, AccountId, Transaction};
+use crate::model::{Account, AccountId, Entry, Transaction, TransactionId};
 use crate::storage::{Storage, StorageError};
 
 #[derive(Debug, Error)]
@@ -40,6 +42,19 @@ enum InputMode {
     Search,
     DateFrom,
     DateTo,
+    DeleteConfirm,
+    EditAccounts,
+    EditAccountsConfirm,
+}
+
+#[derive(Debug, Clone)]
+struct EditAccountsState {
+    id: TransactionId,
+    posted_at: Timestamp,
+    memo: String,
+    entries: Vec<Entry>,
+    buffers: Vec<String>,
+    selected: usize,
 }
 
 struct App {
@@ -54,6 +69,7 @@ struct App {
     input_mode: InputMode,
     input_buffer: String,
     status: String,
+    edit_accounts: Option<EditAccountsState>,
 }
 
 impl App {
@@ -70,6 +86,7 @@ impl App {
             input_mode: InputMode::Normal,
             input_buffer: String::new(),
             status: String::new(),
+            edit_accounts: None,
         };
         app.load()?;
         app.reset_cursor();
@@ -187,6 +204,104 @@ impl App {
         }
     }
 
+    fn selected_transaction(&self) -> Option<Transaction> {
+        if !matches!(self.view, View::Register { .. }) {
+            return None;
+        }
+        let idx = self.table_state.selected()?;
+        self.filtered_transactions().get(idx).cloned()
+    }
+
+    fn start_delete(&mut self) {
+        if self.selected_transaction().is_some() {
+            self.input_mode = InputMode::DeleteConfirm;
+        }
+    }
+
+    fn confirm_delete(&mut self) {
+        let Some(tx) = self.selected_transaction() else {
+            self.input_mode = InputMode::Normal;
+            return;
+        };
+        match self.storage.delete_transaction(tx.id) {
+            Ok(()) => {
+                self.reload_after("transaction deleted");
+            }
+            Err(e) => {
+                self.status = format!("delete failed: {e}");
+                self.input_mode = InputMode::Normal;
+            }
+        }
+    }
+
+    fn start_edit_accounts(&mut self) {
+        let Some(tx) = self.selected_transaction() else {
+            return;
+        };
+        let buffers = tx.entries.iter().map(|e| e.account.to_string()).collect();
+        self.edit_accounts = Some(EditAccountsState {
+            id: tx.id,
+            posted_at: tx.posted_at,
+            memo: tx.memo.clone(),
+            entries: tx.entries.clone(),
+            buffers,
+            selected: 0,
+        });
+        self.input_mode = InputMode::EditAccounts;
+    }
+
+    fn confirm_edit_accounts(&mut self) {
+        let Some(state) = self.edit_accounts.take() else {
+            self.input_mode = InputMode::Normal;
+            return;
+        };
+        let mut entries = Vec::with_capacity(state.entries.len());
+        for (i, original) in state.entries.iter().enumerate() {
+            let buffer = state.buffers.get(i).map_or("", String::as_str);
+            let account = match AccountId::parse(buffer) {
+                Ok(id) => id,
+                Err(e) => {
+                    self.status = format!("invalid account {buffer:?}: {e}");
+                    self.edit_accounts = Some(state);
+                    self.input_mode = InputMode::EditAccounts;
+                    return;
+                }
+            };
+            entries.push(Entry {
+                account,
+                amount: original.amount,
+            });
+        }
+        let tx = match Transaction::new(state.id, state.posted_at, state.memo.clone(), entries) {
+            Ok(t) => t,
+            Err(e) => {
+                self.status = format!("invalid transaction: {e}");
+                self.edit_accounts = Some(state);
+                self.input_mode = InputMode::EditAccounts;
+                return;
+            }
+        };
+        match self.storage.replace_transaction(&tx) {
+            Ok(()) => {
+                self.reload_after("accounts updated");
+            }
+            Err(e) => {
+                self.status = format!("update failed: {e}");
+                self.input_mode = InputMode::Normal;
+            }
+        }
+    }
+
+    fn reload_after(&mut self, status: &str) {
+        if let Err(e) = self.load() {
+            self.status = format!("reload failed: {e}");
+        } else {
+            self.status = status.to_string();
+        }
+        self.input_mode = InputMode::Normal;
+        self.reset_cursor();
+    }
+
     fn status_line(&self) -> String {
         match self.input_mode {
             InputMode::Normal => {
@@ -203,9 +318,7 @@ impl App {
                 if !self.status.is_empty() {
                     let _ = write!(s, "[{}] ", self.status);
                 }
-                s.push_str(
-                    "j/k: move  Enter: drill  Esc: back  /: search  f/t: date  c: clear  r: reload  q: quit",
-                );
+                s.push_str("j/k: move  Enter: drill  Esc: back  /: search  f/t: date  c: clear  C: edit accounts  D: delete  r: reload  q: quit");
                 s
             }
             InputMode::Search => format!("/{}  (Enter: confirm, Esc: cancel)", self.input_buffer),
@@ -217,6 +330,9 @@ impl App {
                 "to (YYYY-MM-DD, empty to clear): {}  (Enter: confirm, Esc: cancel)",
                 self.input_buffer
             ),
+            InputMode::DeleteConfirm => "Delete this transaction? (y/n)".to_string(),
+            InputMode::EditAccounts => "C: edit accounts  j/k: select entry  type to edit account  Enter: confirm  Esc: cancel".to_string(),
+            InputMode::EditAccountsConfirm => "Apply account changes? (y/n)".to_string(),
         }
     }
 }
@@ -274,6 +390,9 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     match app.input_mode {
         InputMode::Normal => handle_normal_key(app, key),
         InputMode::Search | InputMode::DateFrom | InputMode::DateTo => handle_input_key(app, key),
+        InputMode::DeleteConfirm => handle_delete_confirm_key(app, key),
+        InputMode::EditAccounts => handle_edit_accounts_key(app, key),
+        InputMode::EditAccountsConfirm => handle_edit_accounts_confirm_key(app, key),
     }
 }
 
@@ -315,6 +434,14 @@ fn handle_normal_key(app: &mut App, key: KeyEvent) -> bool {
             app.reload();
             false
         }
+        KeyCode::Char('D') => {
+            app.start_delete();
+            false
+        }
+        KeyCode::Char('C') => {
+            app.start_edit_accounts();
+            false
+        }
         KeyCode::Enter => {
             app.drill_in();
             false
@@ -344,7 +471,10 @@ fn handle_input_key(app: &mut App, key: KeyEvent) -> bool {
                 InputMode::DateTo => {
                     app.date_to = parse_date_input(&buffer);
                 }
-                InputMode::Normal => unreachable!(),
+                InputMode::Normal
+                | InputMode::DeleteConfirm
+                | InputMode::EditAccounts
+                | InputMode::EditAccountsConfirm => unreachable!(),
             }
             app.reset_cursor();
             false
@@ -360,6 +490,87 @@ fn handle_input_key(app: &mut App, key: KeyEvent) -> bool {
         }
         KeyCode::Char(c) => {
             app.input_buffer.push(c);
+            false
+        }
+        _ => false,
+    }
+}
+
+fn handle_delete_confirm_key(app: &mut App, key: KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Char('y' | 'Y') => {
+            app.confirm_delete();
+            false
+        }
+        KeyCode::Char('n' | 'N') | KeyCode::Esc | KeyCode::Enter => {
+            app.input_mode = InputMode::Normal;
+            app.status = "delete cancelled".to_string();
+            false
+        }
+        _ => false,
+    }
+}
+
+fn handle_edit_accounts_key(app: &mut App, key: KeyEvent) -> bool {
+    let Some(state) = app.edit_accounts.as_mut() else {
+        app.input_mode = InputMode::Normal;
+        return false;
+    };
+    match key.code {
+        KeyCode::Char('j') | KeyCode::Down => {
+            if state.entries.is_empty() {
+                return false;
+            }
+            let next = (state.selected + 1) % state.entries.len();
+            state.selected = next;
+            false
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            if state.entries.is_empty() {
+                return false;
+            }
+            let prev = state
+                .selected
+                .checked_sub(1)
+                .unwrap_or(state.entries.len() - 1);
+            state.selected = prev;
+            false
+        }
+        KeyCode::Backspace => {
+            if let Some(buf) = state.buffers.get_mut(state.selected) {
+                buf.pop();
+            }
+            false
+        }
+        KeyCode::Enter => {
+            app.input_mode = InputMode::EditAccountsConfirm;
+            false
+        }
+        KeyCode::Esc => {
+            app.edit_accounts = None;
+            app.input_mode = InputMode::Normal;
+            app.status = "edit cancelled".to_string();
+            false
+        }
+        KeyCode::Char(c) => {
+            if let Some(buf) = state.buffers.get_mut(state.selected) {
+                buf.push(c);
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+fn handle_edit_accounts_confirm_key(app: &mut App, key: KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Char('y' | 'Y') => {
+            app.confirm_edit_accounts();
+            false
+        }
+        KeyCode::Char('n' | 'N') | KeyCode::Esc => {
+            app.input_mode = InputMode::EditAccounts;
+            app.status = "edit not applied".to_string();
             false
         }
         _ => false,
@@ -468,4 +679,103 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
 
     let status = app.status_line();
     f.render_widget(Paragraph::new(status), chunks[2]);
+
+    match app.input_mode {
+        InputMode::DeleteConfirm => {
+            render_delete_confirm(f);
+        }
+        InputMode::EditAccounts | InputMode::EditAccountsConfirm => {
+            render_edit_accounts_modal(f, app);
+        }
+        _ => {}
+    }
+}
+
+fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length((area.height - height) / 2),
+            Constraint::Length(height),
+            Constraint::Min(0),
+        ])
+        .split(area);
+    let horizontal = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length((area.width - width) / 2),
+            Constraint::Length(width),
+            Constraint::Min(0),
+        ])
+        .split(area);
+    vertical[1].intersection(horizontal[1])
+}
+
+fn render_delete_confirm(f: &mut ratatui::Frame) {
+    let area = centered_rect(38, 3, f.area());
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .title("Delete transaction");
+    let paragraph = Paragraph::new("Delete this transaction? (y/n)").block(block);
+    f.render_widget(paragraph, area);
+}
+
+fn render_edit_accounts_modal(f: &mut ratatui::Frame, app: &App) {
+    let Some(state) = &app.edit_accounts else {
+        return;
+    };
+
+    let title = if app.input_mode == InputMode::EditAccountsConfirm {
+        "Edit accounts — Apply changes? (y/n)"
+    } else {
+        "Edit accounts"
+    };
+
+    let width = 48;
+    // Entry counts in a single transaction are tiny; truncation from a
+    // usize->u16 is not a real concern here.
+    #[allow(clippy::cast_possible_truncation)]
+    let height = 3 + state.entries.len() as u16;
+    let area = centered_rect(width, height, f.area());
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .title(title);
+
+    let rows: Vec<Line> = state
+        .entries
+        .iter()
+        .enumerate()
+        .map(|(i, entry)| {
+            let selected = i == state.selected;
+            let buf = state.buffers.get(i).map_or("", String::as_str);
+            let account_label = format!("  {buf:<28}");
+            let amount_label = format!("{:>14.2}", entry.amount);
+            let line = Line::from(vec![
+                Span::raw(account_label),
+                Span::styled(amount_label, Style::default().add_modifier(Modifier::DIM)),
+            ]);
+            if selected {
+                line.style(Style::default().add_modifier(Modifier::REVERSED))
+            } else {
+                line
+            }
+        })
+        .collect();
+
+    let help = "  j/k: select  Enter: confirm  Esc: cancel";
+
+    let content: Vec<Line> = rows
+        .into_iter()
+        .chain(std::iter::once(Line::raw("  ")))
+        .chain(std::iter::once(
+            Line::raw(help).style(Style::default().add_modifier(Modifier::DIM)),
+        ))
+        .collect();
+
+    let paragraph = Paragraph::new(content).block(block);
+    f.render_widget(paragraph, area);
 }

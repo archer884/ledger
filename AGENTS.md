@@ -70,6 +70,8 @@ The render path is: `ui()` builds a `Table` widget from filtered data, hands it 
 
 The terminal is restored in a guard pattern inside `tui::run()` — the closure captures the terminal so `restore_terminal` runs even if `App::new` or the event loop errors.
 
+**Modifier-key shortcut rule:** anything that modifies data takes Shift (i.e. an uppercase letter). Read-only navigation and filters use lowercase. So `D` deletes the selected transaction (with a y/n confirmation), and `C` opens the edit-accounts modal (also y/n to apply). Modals are centered overlays — see `centered_rect` and `render_edit_accounts_modal`. A confirmation step is mandatory for any destructive or mutating action from the TUI.
+
 ## CLI
 
 `clap` with `derive` + `env` + `wrap_help` features. Subcommands are an `Option<Command>` so `ledger` with no args defaults to `Tui`. Don't add a subcommand without considering whether it should be the default.

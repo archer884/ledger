@@ -29,6 +29,8 @@ pub enum StorageError {
     InvalidAccountId(String),
     #[error("unknown account: {0}")]
     UnknownAccount(String),
+    #[error("unknown transaction: {0}")]
+    UnknownTransaction(String),
     #[error("invalid transaction: {0}")]
     InvalidTransaction(#[from] TransactionError),
 }
@@ -135,6 +137,65 @@ impl Storage {
             )?;
         }
         tx_conn.commit()?;
+        Ok(())
+    }
+
+    /// # Errors
+    ///
+    /// Returns `StorageError::UnknownAccount` if any entry references an
+    /// account that has not been registered. Also returns an error if the
+    /// underlying `SQLite` transaction or the delete/insert fails.
+    pub fn replace_transaction(&self, tx: &Transaction) -> Result<(), StorageError> {
+        for entry in &tx.entries {
+            let exists: bool = self
+                .conn
+                .query_row(
+                    "SELECT 1 FROM accounts WHERE id = ?1",
+                    params![entry.account.as_str()],
+                    |_| Ok(true),
+                )
+                .optional()?
+                .unwrap_or(false);
+            if !exists {
+                return Err(StorageError::UnknownAccount(entry.account.to_string()));
+            }
+        }
+
+        let tx_conn = self.conn.unchecked_transaction()?;
+        tx_conn.execute(
+            "DELETE FROM transactions WHERE id = ?1",
+            params![tx.id.0.to_string()],
+        )?;
+        tx_conn.execute(
+            "INSERT INTO transactions (id, posted_at, memo) VALUES (?1, ?2, ?3)",
+            params![tx.id.0.to_string(), tx.posted_at.to_string(), tx.memo],
+        )?;
+        for entry in &tx.entries {
+            tx_conn.execute(
+                "INSERT INTO entries (transaction_id, account, amount) VALUES (?1, ?2, ?3)",
+                params![
+                    tx.id.0.to_string(),
+                    entry.account.as_str(),
+                    entry.amount.to_string(),
+                ],
+            )?;
+        }
+        tx_conn.commit()?;
+        Ok(())
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error if the underlying `SQLite` delete fails. The
+    /// schema's `ON DELETE CASCADE` removes the transaction's entries.
+    pub fn delete_transaction(&self, id: TransactionId) -> Result<(), StorageError> {
+        let changed = self.conn.execute(
+            "DELETE FROM transactions WHERE id = ?1",
+            params![id.0.to_string()],
+        )?;
+        if changed == 0 {
+            return Err(StorageError::UnknownTransaction(id.0.to_string()));
+        }
         Ok(())
     }
 
@@ -257,3 +318,165 @@ CREATE TABLE IF NOT EXISTS entries (
 CREATE INDEX IF NOT EXISTS idx_entries_account ON entries(account);
 CREATE INDEX IF NOT EXISTS idx_entries_transaction ON entries(transaction_id);
 ";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use jiff::civil::Date;
+    use jiff::tz::TimeZone;
+
+    fn posted(day: &str) -> Timestamp {
+        Date::strptime("%Y-%m-%d", day)
+            .expect("date parses")
+            .at(0, 0, 0, 0)
+            .to_zoned(TimeZone::UTC)
+            .expect("midnight UTC is never ambiguous")
+            .timestamp()
+    }
+
+    fn acct(storage: &Storage, id: &str, class: AccountClass) -> Account {
+        let account = Account {
+            id: AccountId::parse(id).expect("account parses"),
+            class,
+        };
+        storage
+            .register_account(&account)
+            .expect("account registered");
+        account
+    }
+
+    fn build_tx(
+        id: TransactionId,
+        day: &str,
+        memo: &str,
+        entries: Vec<(String, i64)>,
+    ) -> Transaction {
+        let entries = entries
+            .into_iter()
+            .map(|(a, amt)| Entry {
+                account: AccountId::parse(&a).expect("account parses"),
+                amount: Decimal::from(amt),
+            })
+            .collect();
+        Transaction::new(id, posted(day), memo.to_string(), entries).expect("tx balances")
+    }
+
+    fn tx_balance(storage: &Storage, account: &str, tx_id: TransactionId) -> Decimal {
+        storage
+            .list_transactions()
+            .expect("list works")
+            .into_iter()
+            .find(|t| t.id == tx_id)
+            .expect("tx exists")
+            .entries
+            .into_iter()
+            .filter(|e| e.account.as_str() == account)
+            .map(|e| e.amount)
+            .sum()
+    }
+
+    fn new_storage() -> Storage {
+        let storage = Storage::in_memory().expect("in-memory db");
+        acct(&storage, "checking", AccountClass::Asset);
+        acct(&storage, "savings", AccountClass::Asset);
+        acct(&storage, "income", AccountClass::Equity);
+        acct(&storage, "groceries", AccountClass::Expense);
+        storage
+    }
+
+    #[test]
+    fn delete_transaction_removes_it_and_cascades_entries() {
+        let storage = new_storage();
+        let id = TransactionId::new();
+        let tx = build_tx(
+            id,
+            "2024-01-15",
+            "paycheck",
+            vec![("checking".to_string(), 500), ("income".to_string(), -500)],
+        );
+        storage.save_transaction(&tx).expect("saved");
+
+        assert_eq!(storage.list_transactions().expect("list works").len(), 1);
+        assert_eq!(tx_balance(&storage, "checking", id), Decimal::from(500));
+
+        storage.delete_transaction(id).expect("deleted");
+        assert_eq!(storage.list_transactions().expect("list works").len(), 0);
+        // Cascading delete removed the entries, so the ledger balances back
+        // to its pre-transaction empty state.
+        let balances = storage.balances().expect("balances work");
+        let total: Decimal = balances.values().copied().sum();
+        assert_eq!(total, Decimal::ZERO);
+        assert!(balances.is_empty());
+    }
+
+    #[test]
+    fn delete_unknown_transaction_errors() {
+        let storage = new_storage();
+        let err = storage
+            .delete_transaction(TransactionId::new())
+            .expect_err("missing tx should error");
+        assert!(matches!(err, StorageError::UnknownTransaction(_)));
+    }
+
+    #[test]
+    fn replace_transaction_remaps_accounts_keeping_amounts_and_id() {
+        let storage = new_storage();
+        let id = TransactionId::new();
+        let tx = build_tx(
+            id,
+            "2024-01-15",
+            "paycheck",
+            vec![("checking".to_string(), 500), ("income".to_string(), -500)],
+        );
+        storage.save_transaction(&tx).expect("saved");
+
+        // Re-route the income side to savings instead; amounts unchanged so
+        // the zero-sum invariant holds.
+        let replaced = build_tx(
+            id,
+            "2024-01-15",
+            "paycheck",
+            vec![("checking".to_string(), 500), ("savings".to_string(), -500)],
+        );
+        storage.replace_transaction(&replaced).expect("replaced");
+
+        let listed = storage.list_transactions().expect("list works");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, id);
+        assert_eq!(listed[0].memo, "paycheck");
+        // income no longer involved; savings now holds the credit.
+        assert_eq!(tx_balance(&storage, "income", id), Decimal::ZERO);
+        assert_eq!(tx_balance(&storage, "savings", id), Decimal::from(-500));
+        assert_eq!(tx_balance(&storage, "checking", id), Decimal::from(500));
+    }
+
+    #[test]
+    fn replace_transaction_rejects_unknown_account() {
+        let storage = new_storage();
+        let id = TransactionId::new();
+        let tx = build_tx(
+            id,
+            "2024-01-15",
+            "paycheck",
+            vec![("checking".to_string(), 500), ("income".to_string(), -500)],
+        );
+        storage.save_transaction(&tx).expect("saved");
+
+        let replaced = build_tx(
+            id,
+            "2024-01-15",
+            "paycheck",
+            vec![("checking".to_string(), 500), ("ghost".to_string(), -500)],
+        );
+        let err = storage
+            .replace_transaction(&replaced)
+            .expect_err("ghost account should be rejected");
+        assert!(matches!(err, StorageError::UnknownAccount(_)));
+        // Original transaction is untouched because validation runs before
+        // the delete/insert.
+        let listed = storage.list_transactions().expect("list works");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, id);
+        assert_eq!(tx_balance(&storage, "income", id), Decimal::from(-500));
+    }
+}
