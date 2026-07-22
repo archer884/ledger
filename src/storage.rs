@@ -201,6 +201,51 @@ impl Storage {
 
     /// # Errors
     ///
+    /// Returns `StorageError::UnknownTransaction` if no row matches `id`.
+    /// Also returns an error if the underlying `SQLite` query fails or if any
+    /// stored row fails to parse back into a valid `Transaction`.
+    pub fn get_transaction(&self, id: TransactionId) -> Result<Transaction, StorageError> {
+        let id_str = id.0.to_string();
+        let (posted_at, memo): (String, String) = self
+            .conn
+            .query_row(
+                "SELECT posted_at, memo FROM transactions WHERE id = ?1",
+                params![id_str],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    StorageError::UnknownTransaction(id_str.clone())
+                }
+                other => StorageError::Sqlite(other),
+            })?;
+        let posted_at = Timestamp::from_str(&posted_at)
+            .map_err(|_| StorageError::InvalidTimestamp(posted_at.clone()))?;
+
+        let mut stmt = self.conn.prepare(
+            "SELECT account, amount FROM entries WHERE transaction_id = ?1 ORDER BY rowid",
+        )?;
+        let rows = stmt.query_map(params![id_str], |row| {
+            let account: String = row.get(0)?;
+            let amount: String = row.get(1)?;
+            Ok((account, amount))
+        })?;
+
+        let mut entries = Vec::new();
+        for row in rows {
+            let (account_str, amount_str) = row?;
+            let account = AccountId::parse(&account_str)
+                .map_err(|_| StorageError::InvalidAccountId(account_str.clone()))?;
+            let amount = Decimal::from_str(&amount_str)
+                .map_err(|_| StorageError::InvalidDecimal(amount_str.clone()))?;
+            entries.push(Entry { account, amount });
+        }
+
+        Ok(Transaction::from_raw(id, posted_at, memo, entries))
+    }
+
+    /// # Errors
+    ///
     /// Returns an error if the underlying `SQLite` query fails or if any
     /// stored row fails to parse back into a valid `Transaction`.
     pub fn list_transactions(&self) -> Result<Vec<Transaction>, StorageError> {
@@ -478,5 +523,60 @@ mod tests {
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id, id);
         assert_eq!(tx_balance(&storage, "income", id), Decimal::from(-500));
+    }
+
+    #[test]
+    fn get_transaction_returns_saved_transaction() {
+        let storage = new_storage();
+        let id = TransactionId::new();
+        let tx = build_tx(
+            id,
+            "2024-01-15",
+            "paycheck",
+            vec![("checking".to_string(), 500), ("income".to_string(), -500)],
+        );
+        storage.save_transaction(&tx).expect("saved");
+
+        let got = storage.get_transaction(id).expect("found");
+        assert_eq!(got.id, id);
+        assert_eq!(got.posted_at, posted("2024-01-15"));
+        assert_eq!(got.memo, "paycheck");
+        assert_eq!(got.entries.len(), 2);
+        assert_eq!(got.entries[0].account.as_str(), "checking");
+        assert_eq!(got.entries[0].amount, Decimal::from(500));
+        assert_eq!(got.entries[1].account.as_str(), "income");
+        assert_eq!(got.entries[1].amount, Decimal::from(-500));
+    }
+
+    #[test]
+    fn get_transaction_preserves_entry_order_within_a_transaction() {
+        let storage = new_storage();
+        let id = TransactionId::new();
+        // Deliberately non-alphabetic order; the rowid-ordered read should
+        // mirror the insert order, not sort by account.
+        let tx = build_tx(
+            id,
+            "2024-01-15",
+            "split",
+            vec![
+                ("groceries".to_string(), 60),
+                ("checking".to_string(), -50),
+                ("savings".to_string(), -10),
+            ],
+        );
+        storage.save_transaction(&tx).expect("saved");
+
+        let got = storage.get_transaction(id).expect("found");
+        let order: Vec<&str> = got.entries.iter().map(|e| e.account.as_str()).collect();
+        assert_eq!(order, vec!["groceries", "checking", "savings"]);
+    }
+
+    #[test]
+    fn get_transaction_unknown_id_errors() {
+        let storage = new_storage();
+        let err = storage
+            .get_transaction(TransactionId::new())
+            .expect_err("missing tx should error");
+        assert!(matches!(err, StorageError::UnknownTransaction(_)));
     }
 }

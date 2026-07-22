@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io::{self, Stdout};
 
@@ -20,7 +21,7 @@ use ratatui::widgets::{
 use rust_decimal::Decimal;
 use thiserror::Error;
 
-use crate::model::{Account, AccountId, Entry, Transaction, TransactionId};
+use crate::model::{Account, AccountClass, AccountId, Entry, Transaction, TransactionId};
 use crate::storage::{Storage, StorageError};
 
 #[derive(Debug, Error)]
@@ -45,6 +46,8 @@ enum InputMode {
     DeleteConfirm,
     EditAccounts,
     EditAccountsConfirm,
+    Reconstruct,
+    Help,
 }
 
 #[derive(Debug, Clone)]
@@ -70,6 +73,7 @@ struct App {
     input_buffer: String,
     status: String,
     edit_accounts: Option<EditAccountsState>,
+    reconstruct_cmd: Option<String>,
 }
 
 impl App {
@@ -87,6 +91,7 @@ impl App {
             input_buffer: String::new(),
             status: String::new(),
             edit_accounts: None,
+            reconstruct_cmd: None,
         };
         app.load()?;
         app.reset_cursor();
@@ -292,6 +297,41 @@ impl App {
         }
     }
 
+    fn start_reconstruct(&mut self) {
+        let Some(tx) = self.selected_transaction() else {
+            return;
+        };
+        let classes: HashMap<AccountId, AccountClass> = self
+            .accounts_with_balances
+            .iter()
+            .map(|(a, _)| (a.id.clone(), a.class))
+            .collect();
+        let cmd = match tx.render_add_command(&classes) {
+            Ok(c) => c,
+            Err(e) => {
+                self.status = format!("reconstruct failed: {e}");
+                return;
+            }
+        };
+        match arboard::Clipboard::new()
+            .and_then(|mut cb| cb.set_text(cmd.trim_end_matches('\n').to_string()))
+        {
+            Ok(()) => {
+                self.status = "command copied to clipboard".to_string();
+            }
+            Err(e) => {
+                self.status = format!("clipboard unavailable ({e}); showing command");
+                self.reconstruct_cmd = Some(cmd);
+                self.input_mode = InputMode::Reconstruct;
+            }
+        }
+    }
+
+    fn close_reconstruct(&mut self) {
+        self.reconstruct_cmd = None;
+        self.input_mode = InputMode::Normal;
+    }
+
     fn reload_after(&mut self, status: &str) {
         if let Err(e) = self.load() {
             self.status = format!("reload failed: {e}");
@@ -318,7 +358,7 @@ impl App {
                 if !self.status.is_empty() {
                     let _ = write!(s, "[{}] ", self.status);
                 }
-                s.push_str("j/k: move  Enter: drill  Esc: back  /: search  f/t: date  c: clear  C: edit accounts  D: delete  r: reload  q: quit");
+                s.push_str("?: help  q: quit");
                 s
             }
             InputMode::Search => format!("/{}  (Enter: confirm, Esc: cancel)", self.input_buffer),
@@ -333,6 +373,7 @@ impl App {
             InputMode::DeleteConfirm => "Delete this transaction? (y/n)".to_string(),
             InputMode::EditAccounts => "C: edit accounts  j/k: select entry  type to edit account  Enter: confirm  Esc: cancel".to_string(),
             InputMode::EditAccountsConfirm => "Apply account changes? (y/n)".to_string(),
+            InputMode::Reconstruct | InputMode::Help => "any key to close".to_string(),
         }
     }
 }
@@ -393,6 +434,8 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         InputMode::DeleteConfirm => handle_delete_confirm_key(app, key),
         InputMode::EditAccounts => handle_edit_accounts_key(app, key),
         InputMode::EditAccountsConfirm => handle_edit_accounts_confirm_key(app, key),
+        InputMode::Reconstruct => handle_reconstruct_key(app, key),
+        InputMode::Help => handle_help_key(app, key),
     }
 }
 
@@ -442,6 +485,14 @@ fn handle_normal_key(app: &mut App, key: KeyEvent) -> bool {
             app.start_edit_accounts();
             false
         }
+        KeyCode::Char('y') => {
+            app.start_reconstruct();
+            false
+        }
+        KeyCode::Char('?') => {
+            app.input_mode = InputMode::Help;
+            false
+        }
         KeyCode::Enter => {
             app.drill_in();
             false
@@ -474,7 +525,9 @@ fn handle_input_key(app: &mut App, key: KeyEvent) -> bool {
                 InputMode::Normal
                 | InputMode::DeleteConfirm
                 | InputMode::EditAccounts
-                | InputMode::EditAccountsConfirm => unreachable!(),
+                | InputMode::EditAccountsConfirm
+                | InputMode::Reconstruct
+                | InputMode::Help => unreachable!(),
             }
             app.reset_cursor();
             false
@@ -575,6 +628,16 @@ fn handle_edit_accounts_confirm_key(app: &mut App, key: KeyEvent) -> bool {
         }
         _ => false,
     }
+}
+
+fn handle_reconstruct_key(app: &mut App, _key: KeyEvent) -> bool {
+    app.close_reconstruct();
+    false
+}
+
+fn handle_help_key(app: &mut App, _key: KeyEvent) -> bool {
+    app.input_mode = InputMode::Normal;
+    false
 }
 
 fn format_date(t: Timestamp) -> String {
@@ -687,6 +750,12 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
         InputMode::EditAccounts | InputMode::EditAccountsConfirm => {
             render_edit_accounts_modal(f, app);
         }
+        InputMode::Reconstruct => {
+            render_reconstruct_modal(f, app);
+        }
+        InputMode::Help => {
+            render_help_modal(f);
+        }
         _ => {}
     }
 }
@@ -776,6 +845,76 @@ fn render_edit_accounts_modal(f: &mut ratatui::Frame, app: &App) {
         ))
         .collect();
 
+    let paragraph = Paragraph::new(content).block(block);
+    f.render_widget(paragraph, area);
+}
+
+fn render_reconstruct_modal(f: &mut ratatui::Frame, app: &App) {
+    let Some(cmd) = &app.reconstruct_cmd else {
+        return;
+    };
+    let lines: Vec<Line> = cmd.lines().map(Line::raw).collect();
+    // 2 for the top/bottom border, 1 for the trailing help. Lines are
+    // already short enough to fit a typical terminal; clippy is satisfied
+    // by capping at a sensible width.
+    #[allow(clippy::cast_possible_truncation)]
+    let height = (lines.len() as u16) + 3;
+    let area = centered_rect(60, height, f.area());
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .title("ledger add command (clipboard unavailable — any key to close)");
+    let help = Line::raw("  copy from your terminal selection")
+        .style(Style::default().add_modifier(Modifier::DIM));
+    let content: Vec<Line> = lines
+        .into_iter()
+        .chain(std::iter::once(Line::raw("")))
+        .chain(std::iter::once(help))
+        .collect();
+    let paragraph = Paragraph::new(content).block(block);
+    f.render_widget(paragraph, area);
+}
+
+fn render_help_modal(f: &mut ratatui::Frame) {
+    fn header(s: &str) -> Line<'static> {
+        Line::from(s.to_string()).style(Style::default().add_modifier(Modifier::BOLD))
+    }
+    fn row(keys: &str, desc: &str) -> Line<'static> {
+        Line::from(vec![
+            Span::raw(format!("  {keys:<18}")),
+            Span::raw(desc.to_string()),
+        ])
+    }
+    let content: Vec<Line> = vec![
+        header("Navigation"),
+        row("j / k / \u{2191}\u{2193}", "move cursor"),
+        row("Enter", "drill into account"),
+        row("Esc", "back to accounts"),
+        Line::raw(""),
+        header("Search & filter"),
+        row("/", "substring search"),
+        row("f / t", "set from / to date filter"),
+        row("c", "clear all filters"),
+        Line::raw(""),
+        header("Transaction"),
+        row("y", "copy the ledger add command to the clipboard"),
+        row("C", "edit accounts (y/n to apply)"),
+        row("D", "delete (y/n to confirm)"),
+        Line::raw(""),
+        header("App"),
+        row("r", "reload from disk"),
+        row("?", "show this help"),
+        row("q / Ctrl-C", "quit"),
+    ];
+    #[allow(clippy::cast_possible_truncation)]
+    let height = (content.len() as u16) + 2;
+    let area = centered_rect(48, height, f.area());
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .title("Keyboard shortcuts (any key to close)");
     let paragraph = Paragraph::new(content).block(block);
     f.render_widget(paragraph, area);
 }

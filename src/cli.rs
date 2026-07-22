@@ -7,10 +7,11 @@ use jiff::Timestamp;
 use jiff::civil::Date;
 use jiff::tz::TimeZone;
 use rust_decimal::Decimal;
+use ulid::Ulid;
 
 use crate::model::{
-    Account, AccountClass, AccountId, AccountIdError, Entry, Transaction, TransactionError,
-    TransactionId,
+    Account, AccountClass, AccountId, AccountIdError, Entry, ReconstructError, Transaction,
+    TransactionError, TransactionId,
 };
 use crate::storage::{Storage, StorageError};
 use crate::tui::TuiError;
@@ -40,6 +41,9 @@ pub enum Command {
 
     /// Generate an audit report for a date range
     Audit(AuditArgs),
+
+    /// Print the `ledger add` command that would recreate a transaction
+    Reconstruct(ReconstructArgs),
 
     /// Launch the TUI (the default if no subcommand is given)
     Tui(TuiArgs),
@@ -93,6 +97,17 @@ pub struct AuditArgs {
     pub json: bool,
 }
 
+#[derive(Args)]
+pub struct ReconstructArgs {
+    /// Transaction ID (ULID) to reconstruct (required unless --all is set)
+    #[arg(value_name = "TX_ID", required_unless_present = "all")]
+    pub tx_id: Option<String>,
+
+    /// Reconstruct every transaction in the database, in posted order
+    #[arg(long, conflicts_with = "tx_id")]
+    pub all: bool,
+}
+
 #[derive(Clone, Copy, Debug, ValueEnum)]
 #[clap(rename_all = "lowercase")]
 pub enum AccountClassArg {
@@ -118,10 +133,12 @@ pub enum CliError {
     Storage(StorageError),
     Transaction(TransactionError),
     AccountId(AccountIdError),
+    Reconstruct(ReconstructError),
     Entry(String),
     Amount(String),
     Date(String),
     BookName(String),
+    TxId(String),
     Tui(TuiError),
     Io(std::io::Error),
     Serde(serde_json::Error),
@@ -133,6 +150,7 @@ impl std::fmt::Display for CliError {
             Self::Storage(e) => write!(f, "{e}"),
             Self::Transaction(e) => write!(f, "{e}"),
             Self::AccountId(e) => write!(f, "{e}"),
+            Self::Reconstruct(e) => write!(f, "{e}"),
             Self::Entry(s) => write!(f, "invalid entry: {s} (expected ID[:CLASS]:AMOUNT)"),
             Self::Amount(s) => write!(f, "invalid amount: {s}"),
             Self::Date(s) => write!(f, "invalid date: {s}"),
@@ -140,6 +158,7 @@ impl std::fmt::Display for CliError {
                 f,
                 "invalid book name: {s:?} (must contain only letters and numbers)"
             ),
+            Self::TxId(s) => write!(f, "invalid transaction id: {s}"),
             Self::Tui(e) => write!(f, "{e}"),
             Self::Io(e) => write!(f, "{e}"),
             Self::Serde(e) => write!(f, "json: {e}"),
@@ -164,6 +183,12 @@ impl From<TransactionError> for CliError {
 impl From<AccountIdError> for CliError {
     fn from(e: AccountIdError) -> Self {
         Self::AccountId(e)
+    }
+}
+
+impl From<ReconstructError> for CliError {
+    fn from(e: ReconstructError) -> Self {
+        Self::Reconstruct(e)
     }
 }
 
@@ -197,6 +222,7 @@ pub fn execute() -> Result<(), CliError> {
         Command::Add(args) => run_add(&args, &storage),
         Command::Income(args) => run_income(&args, &storage),
         Command::Audit(args) => run_audit(&args, &storage),
+        Command::Reconstruct(args) => run_reconstruct(&args, &storage),
         Command::Tui(_args) => crate::tui::run(storage).map_err(Into::into),
     }
 }
@@ -222,6 +248,28 @@ fn run_income(args: &IncomeArgs, storage: &Storage) -> Result<(), CliError> {
         &entries,
         storage,
     )
+}
+fn run_reconstruct(args: &ReconstructArgs, storage: &Storage) -> Result<(), CliError> {
+    let classes: HashMap<AccountId, AccountClass> = storage
+        .list_accounts()?
+        .into_iter()
+        .map(|a| (a.id, a.class))
+        .collect();
+    if args.all {
+        let transactions = storage.list_transactions()?;
+        let out = crate::model::render_all_add_commands(&transactions, &classes)?;
+        print!("{out}");
+        return Ok(());
+    }
+    let tx_id_str = args
+        .tx_id
+        .as_deref()
+        .ok_or_else(|| CliError::TxId("TX_ID is required (or pass --all)".to_string()))?;
+    let ulid = Ulid::from_str(tx_id_str).map_err(|e| CliError::TxId(format!("{e}")))?;
+    let tx = storage.get_transaction(TransactionId(ulid))?;
+    let cmd = tx.render_add_command(&classes)?;
+    print!("{cmd}");
+    Ok(())
 }
 
 fn execute_transaction(

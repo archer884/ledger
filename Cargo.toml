@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+arboard = "3"
 clap = { version = "4", features = ["derive", "env", "wrap_help"] }
 crossterm = "0.28"
 dirs = "5"

@@ -23,6 +23,9 @@ cargo run -- tui     # explicit
 |---|---|
 | `ledger add` | Add a transaction with arbitrary entries |
 | `ledger income <amount>` | Shortcut: debit `checking`, credit `income` |
+| `ledger audit --from D --to D` | Receipts / disbursements report for a date range |
+| `ledger reconstruct <tx-id>` | Print the `ledger add` command that would recreate a transaction |
+| `ledger reconstruct --all` | Print every transaction as a `ledger add` command, in posted order (pipable to `sh` to rebuild the database) |
 | `ledger tui` | Launch the TUI (default if no subcommand) |
 | `ledger --help` | Full help |
 
@@ -44,16 +47,32 @@ Two entries minimum per transaction, and the amounts must sum to zero. The model
 
 ### TUI keys
 
-| Key | Action |
-|---|---|
-| `j` / `k` / `↓` / `↑` | Move cursor |
-| `Enter` | Drill into selected account's register |
-| `Esc` | Back to accounts list |
-| `/` | Filter current list (substring search) |
-| `f` / `t` | Set from / to date filter (register view) |
-| `c` | Clear all filters |
-| `r` | Reload from disk |
-| `q` / `Ctrl-C` | Quit |
+Press `?` in the TUI to open a dialog listing every shortcut, grouped by what they do. The status line at the bottom of the TUI is intentionally terse; the dialog is the reference.
+
+## Reconstructing transactions
+
+For a single transaction, the TUI's `y` key copies the `ledger add` command that would recreate the selected row to your clipboard. On the CLI, `ledger reconstruct <TX_ID>` prints the same thing to stdout.
+
+For the whole database, `ledger reconstruct --all` writes a series of `ledger add` commands in posted order, separated by blank lines. The output is a portable shell script — paste it into a file, edit what you need to fix, and replay it. This is the cleanest way to rewrite history when a transaction was entered with wrong values, since the alternative is to post a correction that confuses later reports.
+
+```bash
+# 1. Dump the current database to a script
+ledger reconstruct --all > rebuild.sh
+
+# 2. Edit rebuild.sh to fix the wrong values
+
+# 3. Validate the script against a scratch database first
+LEDGER_DB=/tmp/scratch.db sh rebuild.sh
+
+# 4. If the audit looks right, replay against the real database
+sh rebuild.sh
+```
+
+A few things to know:
+
+- **DB path.** `reconstruct --all` reads from the current DB; the `ledger add` calls in the script use the current DB too. To write somewhere fresh, set `LEDGER_DB` in the replay step (e.g. `LEDGER_DB=/tmp/scratch.db sh rebuild.sh`). Otherwise you'll append to the original and get duplicates of everything.
+- **New transaction IDs.** The rebuilt transactions get fresh ULIDs — they're not byte-identical to the originals. The financial content (dates, accounts, amounts, memos) is preserved.
+- **Errors don't stop the script.** If your edit produces an unbalanced entry, `sh` reports the error and keeps going. Always validate against a scratch DB before applying to the real one. `ledger audit` over the rebuilt DB is a quick way to confirm the numbers match.
 
 ## The accounting model
 
