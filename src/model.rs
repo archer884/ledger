@@ -110,6 +110,7 @@ pub enum AccountClass {
     Asset,
     Liability,
     Equity,
+    Income,
     Expense,
 }
 
@@ -279,6 +280,68 @@ pub enum ReconstructError {
     UnknownAccount(AccountId),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CloseInfo {
+    pub id: TransactionId,
+    pub posted_at: Timestamp,
+}
+
+/// Identify the fiscal-year closing transactions in a ledger.
+///
+/// A transaction is a close iff it posts to at least one income or
+/// expense account, every one of its remaining entries posts to an
+/// equity account, and after applying it every income and expense
+/// account in `classes` has an all-time balance of exactly zero.
+/// `transactions` must be in posted order, as returned by
+/// `storage::list_transactions`; balances are tracked across the whole
+/// slice, so closes buried in history are still recognized.
+#[must_use]
+pub fn detect_closes(
+    transactions: &[Transaction],
+    classes: &HashMap<AccountId, AccountClass>,
+) -> Vec<CloseInfo> {
+    let mut balances: HashMap<AccountId, Decimal> = HashMap::new();
+    let mut closes = Vec::new();
+
+    for tx in transactions {
+        let mut touches_nominal = false;
+        let mut others_all_equity = true;
+        for entry in &tx.entries {
+            match classes.get(&entry.account) {
+                Some(AccountClass::Income | AccountClass::Expense) => {
+                    touches_nominal = true;
+                }
+                Some(AccountClass::Equity) => {}
+                Some(AccountClass::Asset | AccountClass::Liability) | None => {
+                    others_all_equity = false;
+                }
+            }
+        }
+
+        for entry in &tx.entries {
+            *balances
+                .entry(entry.account.clone())
+                .or_insert(Decimal::ZERO) += entry.amount;
+        }
+
+        if !touches_nominal || !others_all_equity {
+            continue;
+        }
+
+        let nominals_zero = classes
+            .iter()
+            .filter(|(_, class)| matches!(class, AccountClass::Income | AccountClass::Expense))
+            .all(|(id, _)| balances.get(id).is_none_or(|b| *b == Decimal::ZERO));
+        if nominals_zero {
+            closes.push(CloseInfo {
+                id: tx.id,
+                posted_at: tx.posted_at,
+            });
+        }
+    }
+    closes
+}
+
 impl std::fmt::Display for ReconstructError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -294,6 +357,7 @@ fn class_to_str(class: AccountClass) -> &'static str {
         AccountClass::Asset => "asset",
         AccountClass::Liability => "liability",
         AccountClass::Equity => "equity",
+        AccountClass::Income => "income",
         AccountClass::Expense => "expense",
     }
 }
@@ -367,6 +431,20 @@ mod tests {
             cmd,
             "ledger add --date 2024-01-15 \\\n  --memo Paycheck \\\n  --entry checking:asset:1000 \\\n  --entry income:equity:-1000\n"
         );
+    }
+
+    #[test]
+    fn render_income_class_entry() {
+        let transaction = tx(
+            "Paycheck",
+            vec![entry("checking", "1000"), entry("income", "-1000")],
+        );
+        let classes = classes(&[
+            ("checking", AccountClass::Asset),
+            ("income", AccountClass::Income),
+        ]);
+        let cmd = transaction.render_add_command(&classes).expect("ok");
+        assert!(cmd.contains("--entry income:income:-1000"), "got: {cmd}");
     }
 
     #[test]
@@ -529,5 +607,146 @@ mod tests {
             err,
             ReconstructError::UnknownAccount(AccountId::parse("ghost").unwrap())
         );
+    }
+
+    fn close(day: &str, entries: Vec<Entry>) -> Transaction {
+        Transaction::new(TransactionId::new(), ts(day), String::new(), entries)
+            .expect("close balances")
+    }
+
+    fn fy_classes() -> HashMap<AccountId, AccountClass> {
+        classes(&[
+            ("checking", AccountClass::Asset),
+            ("salary", AccountClass::Income),
+            ("expenses/food", AccountClass::Expense),
+            ("equity/net", AccountClass::Equity),
+        ])
+    }
+
+    fn running_balances(transactions: &[Transaction]) -> HashMap<AccountId, Decimal> {
+        let mut all: HashMap<AccountId, Decimal> = HashMap::new();
+        for t in transactions {
+            for (account, delta) in t.balance_by_account() {
+                *all.entry(account).or_insert(Decimal::ZERO) += delta;
+            }
+        }
+        all
+    }
+
+    #[test]
+    fn detect_closes_finds_a_proper_close() {
+        let closing = close(
+            "2024-12-31",
+            vec![
+                entry("salary", "1000"),
+                entry("expenses/food", "-100"),
+                entry("equity/net", "-900"),
+            ],
+        );
+        let transactions = vec![
+            tx(
+                "",
+                vec![entry("checking", "1000"), entry("salary", "-1000")],
+            ),
+            tx(
+                "",
+                vec![entry("expenses/food", "100"), entry("checking", "-100")],
+            ),
+            closing.clone(),
+        ];
+        let closes = detect_closes(&transactions, &fy_classes());
+        assert_eq!(
+            closes,
+            vec![CloseInfo {
+                id: closing.id,
+                posted_at: ts("2024-12-31")
+            }]
+        );
+
+        let balances = running_balances(&transactions);
+        assert_eq!(
+            balances[&AccountId::parse("salary").unwrap()],
+            Decimal::ZERO
+        );
+        assert_eq!(
+            balances[&AccountId::parse("expenses/food").unwrap()],
+            Decimal::ZERO
+        );
+        let total: Decimal = balances.values().copied().sum();
+        assert_eq!(total, Decimal::ZERO);
+    }
+
+    #[test]
+    fn detect_closes_ignores_open_and_paycheck() {
+        let classes = fy_classes();
+        let transactions = vec![
+            tx(
+                "",
+                vec![entry("checking", "100"), entry("equity/net", "-100")],
+            ),
+            tx("", vec![entry("checking", "200"), entry("salary", "-200")]),
+        ];
+        assert_eq!(detect_closes(&transactions, &classes), vec![]);
+    }
+
+    #[test]
+    fn detect_closes_rejects_partial_zeroing() {
+        // salary is zeroed but expenses/food still carries +100.
+        let classes = fy_classes();
+        let transactions = vec![
+            tx(
+                "",
+                vec![entry("checking", "1000"), entry("salary", "-1000")],
+            ),
+            tx(
+                "",
+                vec![entry("expenses/food", "100"), entry("checking", "-100")],
+            ),
+            tx(
+                "",
+                vec![entry("salary", "1000"), entry("equity/net", "-1000")],
+            ),
+        ];
+        assert_eq!(detect_closes(&transactions, &classes), vec![]);
+    }
+
+    #[test]
+    fn detect_closes_rejects_asset_entries() {
+        let classes = fy_classes();
+        let transactions = vec![
+            tx("", vec![entry("checking", "100"), entry("salary", "-100")]),
+            tx("", vec![entry("salary", "100"), entry("checking", "-100")]),
+        ];
+        assert_eq!(detect_closes(&transactions, &classes), vec![]);
+    }
+
+    #[test]
+    fn detect_closes_finds_consecutive_closes() {
+        let classes = fy_classes();
+        let first = close(
+            "2024-12-31",
+            vec![entry("salary", "1000"), entry("equity/net", "-1000")],
+        );
+        let second = close(
+            "2025-12-31",
+            vec![entry("salary", "500"), entry("equity/net", "-500")],
+        );
+        let first_id = first.id;
+        let second_id = second.id;
+        let transactions = vec![
+            tx(
+                "",
+                vec![entry("checking", "1000"), entry("salary", "-1000")],
+            ),
+            first,
+            tx("", vec![entry("checking", "500"), entry("salary", "-500")]),
+            second,
+        ];
+        let closes = detect_closes(&transactions, &classes);
+        assert_eq!(closes.len(), 2);
+        assert_eq!(closes[0].posted_at, ts("2024-12-31"));
+        assert_eq!(closes[1].posted_at, ts("2025-12-31"));
+        assert_eq!(closes[0].id, first_id);
+        assert_eq!(closes[1].id, second_id);
     }
 }

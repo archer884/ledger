@@ -10,8 +10,8 @@ use rust_decimal::Decimal;
 use ulid::Ulid;
 
 use crate::model::{
-    Account, AccountClass, AccountId, AccountIdError, Entry, ReconstructError, Transaction,
-    TransactionError, TransactionId,
+    Account, AccountClass, AccountId, AccountIdError, CloseInfo, Entry, ReconstructError,
+    Transaction, TransactionError, TransactionId, detect_closes,
 };
 use crate::storage::{Storage, StorageError};
 use crate::tui::TuiError;
@@ -39,7 +39,13 @@ pub enum Command {
     /// Record income (debit checking, credit income)
     Income(IncomeArgs),
 
-    /// Generate an audit report for a date range
+    /// Close the fiscal year: zero every income and expense account into equity/net
+    Close(CloseArgs),
+
+    /// Record opening balances on an empty database (plugs equity/net)
+    Open(OpenArgs),
+
+    /// Generate an audit report for a date range or fiscal year
     Audit(AuditArgs),
 
     /// Print the `ledger add` command that would recreate a transaction
@@ -83,14 +89,45 @@ pub struct IncomeArgs {
 }
 
 #[derive(Args)]
+pub struct CloseArgs {
+    /// Date of the closing transaction (YYYY-MM-DD), defaults to today
+    #[arg(long)]
+    pub date: Option<String>,
+
+    /// Memo describing the close
+    #[arg(long)]
+    pub memo: Option<String>,
+}
+
+#[derive(Args)]
+pub struct OpenArgs {
+    /// Known opening balance in the form ID:CLASS:AMOUNT (e.g. checking:asset:1000)
+    #[arg(long = "entry", value_name = "ID:CLASS:AMOUNT", required = true)]
+    pub entries: Vec<String>,
+
+    /// Date of the opening transaction (YYYY-MM-DD), defaults to today
+    #[arg(long)]
+    pub date: Option<String>,
+
+    /// Memo describing the opening
+    #[arg(long)]
+    pub memo: Option<String>,
+}
+
+#[derive(Args)]
 pub struct AuditArgs {
     /// Start date of the report (inclusive, YYYY-MM-DD)
-    #[arg(long)]
-    pub from: String,
+    #[arg(long, required_unless_present = "fy")]
+    pub from: Option<String>,
 
     /// End date of the report (exclusive, YYYY-MM-DD)
-    #[arg(long)]
-    pub to: String,
+    #[arg(long, required_unless_present = "fy")]
+    pub to: Option<String>,
+
+    /// Fiscal year to report on: the calendar year of its closing
+    /// transaction, or "latest" for the most recent close
+    #[arg(long, conflicts_with_all = ["from", "to"])]
+    pub fy: Option<String>,
 
     /// Emit the report as a JSON blob instead of human-readable text
     #[arg(long)]
@@ -114,6 +151,7 @@ pub enum AccountClassArg {
     Asset,
     Liability,
     Equity,
+    Income,
     Expense,
 }
 
@@ -123,6 +161,7 @@ impl From<AccountClassArg> for AccountClass {
             AccountClassArg::Asset => AccountClass::Asset,
             AccountClassArg::Liability => AccountClass::Liability,
             AccountClassArg::Equity => AccountClass::Equity,
+            AccountClassArg::Income => AccountClass::Income,
             AccountClassArg::Expense => AccountClass::Expense,
         }
     }
@@ -139,6 +178,9 @@ pub enum CliError {
     Date(String),
     BookName(String),
     TxId(String),
+    Close(String),
+    Open(String),
+    Fy(String),
     Tui(TuiError),
     Io(std::io::Error),
     Serde(serde_json::Error),
@@ -159,6 +201,9 @@ impl std::fmt::Display for CliError {
                 "invalid book name: {s:?} (must contain only letters and numbers)"
             ),
             Self::TxId(s) => write!(f, "invalid transaction id: {s}"),
+            Self::Close(s) => write!(f, "close: {s}"),
+            Self::Open(s) => write!(f, "open: {s}"),
+            Self::Fy(s) => write!(f, "fiscal year: {s}"),
             Self::Tui(e) => write!(f, "{e}"),
             Self::Io(e) => write!(f, "{e}"),
             Self::Serde(e) => write!(f, "json: {e}"),
@@ -221,6 +266,8 @@ pub fn execute() -> Result<(), CliError> {
     match command {
         Command::Add(args) => run_add(&args, &storage),
         Command::Income(args) => run_income(&args, &storage),
+        Command::Close(args) => run_close(&args, &storage),
+        Command::Open(args) => run_open(&args, &storage),
         Command::Audit(args) => run_audit(&args, &storage),
         Command::Reconstruct(args) => run_reconstruct(&args, &storage),
         Command::Tui(_args) => crate::tui::run(storage).map_err(Into::into),
@@ -240,7 +287,7 @@ fn run_income(args: &IncomeArgs, storage: &Storage) -> Result<(), CliError> {
     let amount = Decimal::from_str(&args.amount).map_err(|e| CliError::Amount(format!("{e}")))?;
     let entries = vec![
         format!("checking:asset:{amount}"),
-        format!("income:equity:-{amount}"),
+        format!("income:income:-{amount}"),
     ];
     execute_transaction(
         args.date.as_deref(),
@@ -248,6 +295,88 @@ fn run_income(args: &IncomeArgs, storage: &Storage) -> Result<(), CliError> {
         &entries,
         storage,
     )
+}
+
+fn run_close(args: &CloseArgs, storage: &Storage) -> Result<(), CliError> {
+    let classes = account_classes(storage)?;
+    let balances = storage.balances()?;
+
+    let mut nominals: Vec<(AccountId, &'static str, Decimal)> = balances
+        .iter()
+        .filter_map(|(id, balance)| match classes.get(id) {
+            Some(AccountClass::Income) if *balance != Decimal::ZERO => {
+                Some((id.clone(), "income", *balance))
+            }
+            Some(AccountClass::Expense) if *balance != Decimal::ZERO => {
+                Some((id.clone(), "expense", *balance))
+            }
+            _ => None,
+        })
+        .collect();
+
+    if nominals.is_empty() {
+        return Err(CliError::Close(
+            "nothing to close: every income and expense account is already zero".to_string(),
+        ));
+    }
+    nominals.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+
+    let nominal_sum: Decimal = nominals.iter().map(|(_, _, b)| *b).sum();
+    let net_income = -nominal_sum;
+    let plug = nominal_sum;
+
+    let mut entries: Vec<String> = nominals
+        .iter()
+        .map(|(id, class, balance)| format!("{id}:{class}:{}", -balance))
+        .collect();
+    entries.push(format!("equity/net:equity:{plug}"));
+
+    execute_transaction(
+        args.date.as_deref(),
+        args.memo.as_deref(),
+        &entries,
+        storage,
+    )?;
+
+    for (id, class, balance) in &nominals {
+        println!("zeroed {id} ({class}) by {}", -balance);
+    }
+    println!("net income {net_income} rolled into equity/net");
+    Ok(())
+}
+
+fn run_open(args: &OpenArgs, storage: &Storage) -> Result<(), CliError> {
+    if !storage.list_transactions()?.is_empty() {
+        return Err(CliError::Open(
+            "the ledger already has transactions; `open` is only for an empty database".to_string(),
+        ));
+    }
+
+    let mut sum = Decimal::ZERO;
+    for entry_str in &args.entries {
+        sum += parse_entry(entry_str)?.amount;
+    }
+
+    let plug = -sum;
+    let mut entries = args.entries.clone();
+    entries.push(format!("equity/net:equity:{plug}"));
+
+    execute_transaction(
+        args.date.as_deref(),
+        args.memo.as_deref(),
+        &entries,
+        storage,
+    )?;
+    println!("recorded opening balances; equity/net plugged by {plug}");
+    Ok(())
+}
+
+fn account_classes(storage: &Storage) -> Result<HashMap<AccountId, AccountClass>, StorageError> {
+    Ok(storage
+        .list_accounts()?
+        .into_iter()
+        .map(|a| (a.id, a.class))
+        .collect())
 }
 fn run_reconstruct(args: &ReconstructArgs, storage: &Storage) -> Result<(), CliError> {
     let classes: HashMap<AccountId, AccountClass> = storage
@@ -328,15 +457,25 @@ struct AuditReport {
 }
 
 fn run_audit(args: &AuditArgs, storage: &Storage) -> Result<(), CliError> {
-    let from = parse_date(&args.from)?;
-    let to = parse_date(&args.to)?;
+    let transactions = storage.list_transactions()?;
+    let (from, to) = match &args.fy {
+        Some(fy) => {
+            let classes = account_classes(storage)?;
+            let closes = detect_closes(&transactions, &classes);
+            resolve_fy_period(&transactions, &closes, fy)?
+        }
+        None => (
+            parse_date(args.from.as_deref().unwrap_or(""))?,
+            parse_date(args.to.as_deref().unwrap_or(""))?,
+        ),
+    };
     if to < from {
         return Err(CliError::Date(format!(
-            "--to ({}) is before --from ({})",
-            args.to, args.from
+            "report end ({}) is before start ({})",
+            format_date(to),
+            format_date(from)
         )));
     }
-    let transactions = storage.list_transactions()?;
     let our_accounts = asset_accounts(storage)?;
     let report = build_audit_report(&transactions, from, to, &our_accounts);
 
@@ -346,6 +485,89 @@ fn run_audit(args: &AuditArgs, storage: &Storage) -> Result<(), CliError> {
         print_audit_text(&report);
     }
     Ok(())
+}
+
+/// Resolve an `--fy` argument to a `(from, to)` audit period. `latest`
+/// selects the most recent close; anything else must be the calendar
+/// year (UTC) of a close's posted date. The period starts at the
+/// previous close (or at the first transaction, for the first fiscal
+/// year) and ends the day after the selected close, so the closing
+/// transaction itself is included.
+///
+/// # Errors
+///
+/// Returns `CliError::Fy` if the ledger has no closes, the argument is
+/// neither `latest` nor a parseable year, no close falls in the given
+/// year, or more than one does.
+fn resolve_fy_period(
+    transactions: &[Transaction],
+    closes: &[CloseInfo],
+    fy: &str,
+) -> Result<(Timestamp, Timestamp), CliError> {
+    if closes.is_empty() {
+        return Err(CliError::Fy(
+            "no closing transactions in the ledger; run `ledger close` first or use --from/--to"
+                .to_string(),
+        ));
+    }
+
+    let close_year = |c: &CloseInfo| c.posted_at.to_zoned(TimeZone::UTC).year();
+    let index = if fy == "latest" {
+        closes.len() - 1
+    } else {
+        let year: i16 = fy.parse().map_err(|_| {
+            CliError::Fy(format!(
+                "invalid year {fy:?} (expected a year like 2025, or \"latest\")"
+            ))
+        })?;
+        let matching: Vec<usize> = closes
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| close_year(c) == year)
+            .map(|(i, _)| i)
+            .collect();
+        match matching.as_slice() {
+            [] => {
+                let mut years: Vec<i16> = closes.iter().map(close_year).collect();
+                years.sort_unstable();
+                years.dedup();
+                let list = years
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(CliError::Fy(format!(
+                    "no close in {year}; closed years: {list}"
+                )));
+            }
+            [only] => *only,
+            _ => {
+                return Err(CliError::Fy(
+                    "multiple closes in {year}; use --from/--to to pick an exact range".to_string(),
+                ));
+            }
+        }
+    };
+
+    let close = closes[index];
+    let from = if index == 0 {
+        transactions
+            .first()
+            .map_or(close.posted_at, |t| t.posted_at)
+    } else {
+        closes[index - 1].posted_at
+    };
+    let to = close
+        .posted_at
+        .to_zoned(TimeZone::UTC)
+        .date()
+        .tomorrow()
+        .map_err(|e| CliError::Fy(format!("day after close: {e}")))?
+        .at(0, 0, 0, 0)
+        .to_zoned(TimeZone::UTC)
+        .map_err(|e| CliError::Fy(format!("day after close: {e}")))?
+        .timestamp();
+    Ok((from, to))
 }
 
 /// Build an audit report from a set of transactions. Pure and testable: the
@@ -608,6 +830,7 @@ fn parse_entry(s: &str) -> Result<ParsedEntry, CliError> {
                 "asset" => AccountClassArg::Asset,
                 "liability" => AccountClassArg::Liability,
                 "equity" => AccountClassArg::Equity,
+                "income" => AccountClassArg::Income,
                 "expense" => AccountClassArg::Expense,
                 other => {
                     return Err(CliError::Entry(format!("{s}: unknown class '{other}'")));
@@ -715,6 +938,14 @@ mod tests {
 
     fn acct(id: &str) -> AccountId {
         AccountId::parse(id).unwrap()
+    }
+
+    #[test]
+    fn parse_entry_accepts_income_class() {
+        let parsed = parse_entry("salary:income:1000").expect("parses");
+        assert_eq!(parsed.id.as_str(), "salary");
+        assert_eq!(parsed.amount, Decimal::from(1000));
+        assert!(matches!(parsed.class, Some(AccountClassArg::Income)));
     }
 
     #[test]
@@ -900,5 +1131,195 @@ mod tests {
         assert_eq!(report.total_disbursements, Decimal::ZERO);
         assert!(report.receipts.is_empty());
         assert!(report.disbursements.is_empty());
+    }
+
+    fn close_info(day: &str) -> CloseInfo {
+        CloseInfo {
+            id: TransactionId::new(),
+            posted_at: date(day),
+        }
+    }
+
+    #[test]
+    fn fy_latest_resolves_to_the_last_close() {
+        let transactions = vec![
+            tx(
+                "2024-01-05",
+                vec![entry("checking", 1), entry("income", -1)],
+            ),
+            tx(
+                "2025-01-05",
+                vec![entry("checking", 2), entry("income", -2)],
+            ),
+        ];
+        let closes = vec![close_info("2024-12-31"), close_info("2025-12-31")];
+        let (from, to) = resolve_fy_period(&transactions, &closes, "latest").expect("resolves");
+        assert_eq!(from, date("2024-12-31"));
+        assert_eq!(to, date("2026-01-01"));
+    }
+
+    #[test]
+    fn fy_first_year_starts_at_first_transaction() {
+        let transactions = vec![tx(
+            "2025-01-01",
+            vec![entry("checking", 100), entry("equity/net", -100)],
+        )];
+        let closes = vec![close_info("2025-12-31")];
+        let (from, to) = resolve_fy_period(&transactions, &closes, "2025").expect("resolves");
+        assert_eq!(from, date("2025-01-01"));
+        assert_eq!(to, date("2026-01-01"));
+    }
+
+    #[test]
+    fn fy_unknown_year_lists_closed_years() {
+        let transactions = vec![tx(
+            "2024-01-05",
+            vec![entry("checking", 1), entry("income", -1)],
+        )];
+        let closes = vec![close_info("2024-12-31")];
+        let err = resolve_fy_period(&transactions, &closes, "2027").expect_err("no close");
+        assert!(matches!(err, CliError::Fy(_)));
+        assert!(err.to_string().contains("closed years: 2024"), "{err}");
+    }
+
+    #[test]
+    fn fy_ambiguous_year_errors() {
+        let transactions = vec![tx(
+            "2025-01-05",
+            vec![entry("checking", 1), entry("income", -1)],
+        )];
+        let closes = vec![close_info("2025-06-30"), close_info("2025-12-31")];
+        let err = resolve_fy_period(&transactions, &closes, "2025").expect_err("ambiguous");
+        assert!(matches!(err, CliError::Fy(_)));
+    }
+
+    #[test]
+    fn fy_without_closes_errors() {
+        let err = resolve_fy_period(&[], &[], "latest").expect_err("no closes");
+        assert!(matches!(err, CliError::Fy(_)));
+    }
+
+    #[test]
+    fn fy_rejects_non_year_argument() {
+        let transactions = vec![tx(
+            "2024-01-05",
+            vec![entry("checking", 1), entry("income", -1)],
+        )];
+        let closes = vec![close_info("2024-12-31")];
+        let err = resolve_fy_period(&transactions, &closes, "banana").expect_err("not a year");
+        assert!(matches!(err, CliError::Fy(_)));
+    }
+
+    #[test]
+    fn close_zeroes_nominals_and_plugs_equity_net() {
+        let storage = Storage::in_memory().expect("in-memory db");
+        for (id, class) in [
+            ("checking", AccountClass::Asset),
+            ("salary", AccountClass::Income),
+            ("expenses/food", AccountClass::Expense),
+        ] {
+            storage
+                .register_account(&Account {
+                    id: AccountId::parse(id).expect("account parses"),
+                    class,
+                })
+                .expect("registered");
+        }
+        storage
+            .save_transaction(&tx(
+                "2025-06-01",
+                vec![entry("checking", 2000), entry("salary", -2000)],
+            ))
+            .expect("saved");
+        storage
+            .save_transaction(&tx(
+                "2025-06-02",
+                vec![entry("expenses/food", 500), entry("checking", -500)],
+            ))
+            .expect("saved");
+
+        let args = CloseArgs {
+            date: Some("2025-12-31".to_string()),
+            memo: Some("FY2025".to_string()),
+        };
+        run_close(&args, &storage).expect("close works");
+
+        let balances = storage.balances().expect("balances");
+        assert_eq!(balances[&acct("salary")], Decimal::ZERO);
+        assert_eq!(balances[&acct("expenses/food")], Decimal::ZERO);
+        assert_eq!(balances[&acct("checking")], Decimal::from(1500));
+        assert_eq!(balances[&acct("equity/net")], Decimal::from(-1500));
+
+        let transactions = storage.list_transactions().expect("list");
+        let classes = account_classes(&storage).expect("classes");
+        assert_eq!(detect_closes(&transactions, &classes).len(), 1);
+    }
+
+    #[test]
+    fn close_with_nothing_to_close_errors() {
+        let storage = Storage::in_memory().expect("in-memory db");
+        storage
+            .register_account(&Account {
+                id: AccountId::parse("salary").expect("account parses"),
+                class: AccountClass::Income,
+            })
+            .expect("registered");
+        let args = CloseArgs {
+            date: None,
+            memo: None,
+        };
+        let err = run_close(&args, &storage).expect_err("nothing to close");
+        assert!(matches!(err, CliError::Close(_)));
+    }
+
+    #[test]
+    fn open_plugs_the_difference_into_equity_net() {
+        let storage = Storage::in_memory().expect("in-memory db");
+        let args = OpenArgs {
+            entries: vec![
+                "checking:asset:1000".to_string(),
+                "mortgage:liability:-300".to_string(),
+            ],
+            date: Some("2025-01-01".to_string()),
+            memo: None,
+        };
+        run_open(&args, &storage).expect("open works");
+
+        let balances = storage.balances().expect("balances");
+        assert_eq!(balances[&acct("checking")], Decimal::from(1000));
+        assert_eq!(balances[&acct("mortgage")], Decimal::from(-300));
+        assert_eq!(balances[&acct("equity/net")], Decimal::from(-700));
+        assert_eq!(storage.list_transactions().expect("list").len(), 1);
+    }
+
+    #[test]
+    fn open_refuses_nonempty_ledger() {
+        let storage = Storage::in_memory().expect("in-memory db");
+        storage
+            .register_account(&Account {
+                id: AccountId::parse("checking").expect("account parses"),
+                class: AccountClass::Asset,
+            })
+            .expect("registered");
+        storage
+            .register_account(&Account {
+                id: AccountId::parse("income").expect("account parses"),
+                class: AccountClass::Income,
+            })
+            .expect("registered");
+        storage
+            .save_transaction(&tx(
+                "2025-06-01",
+                vec![entry("checking", 100), entry("income", -100)],
+            ))
+            .expect("saved");
+
+        let args = OpenArgs {
+            entries: vec!["checking:asset:1000".to_string()],
+            date: None,
+            memo: None,
+        };
+        let err = run_open(&args, &storage).expect_err("non-empty ledger");
+        assert!(matches!(err, CliError::Open(_)));
     }
 }

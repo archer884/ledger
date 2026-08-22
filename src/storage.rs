@@ -328,6 +328,7 @@ fn class_to_str(class: AccountClass) -> &'static str {
         AccountClass::Asset => "asset",
         AccountClass::Liability => "liability",
         AccountClass::Equity => "equity",
+        AccountClass::Income => "income",
         AccountClass::Expense => "expense",
     }
 }
@@ -337,6 +338,7 @@ fn class_from_str(s: &str) -> Result<AccountClass, StorageError> {
         "asset" => Ok(AccountClass::Asset),
         "liability" => Ok(AccountClass::Liability),
         "equity" => Ok(AccountClass::Equity),
+        "income" => Ok(AccountClass::Income),
         "expense" => Ok(AccountClass::Expense),
         other => Err(StorageError::InvalidClass(other.to_string())),
     }
@@ -345,7 +347,7 @@ fn class_from_str(s: &str) -> Result<AccountClass, StorageError> {
 const SCHEMA: &str = r"
 CREATE TABLE IF NOT EXISTS accounts (
     id TEXT PRIMARY KEY,
-    class TEXT NOT NULL CHECK (class IN ('asset', 'liability', 'equity', 'expense'))
+    class TEXT NOT NULL CHECK (class IN ('asset', 'liability', 'equity', 'income', 'expense'))
 );
 
 CREATE TABLE IF NOT EXISTS transactions (
@@ -427,6 +429,17 @@ mod tests {
         acct(&storage, "income", AccountClass::Equity);
         acct(&storage, "groceries", AccountClass::Expense);
         storage
+    }
+
+    #[test]
+    fn income_class_account_round_trips() {
+        let storage = Storage::in_memory().expect("in-memory db");
+        acct(&storage, "salary", AccountClass::Income);
+
+        let accounts = storage.list_accounts().expect("list works");
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].id.as_str(), "salary");
+        assert_eq!(accounts[0].class, AccountClass::Income);
     }
 
     #[test]

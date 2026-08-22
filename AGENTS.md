@@ -53,7 +53,7 @@ If you find yourself importing `rusqlite` from `cli.rs` or `ratatui` from `stora
 ## DB schema (storage.rs)
 
 ```
-accounts(id TEXT PK, class TEXT CHECK in 'asset'/'liability'/'equity'/'expense')
+accounts(id TEXT PK, class TEXT CHECK in 'asset'/'liability'/'equity'/'income'/'expense')
 transactions(id TEXT PK, posted_at TEXT, memo TEXT)
 entries(transaction_id TEXT FK→transactions, account TEXT FK→accounts, amount TEXT)
 ```
@@ -78,7 +78,7 @@ The terminal is restored in a guard pattern inside `tui::run()` — the closure 
 
 Env vars: `LEDGER_DB` (full path override), `LEDGER_BOOK` (filename suffix, validated to be `is_ascii_alphanumeric()` and non-empty).
 
-The `income` subcommand is a shortcut that builds two specific entries (`checking:asset:N`, `income:equity:-N`) and routes them through the same `execute_transaction` helper as `add`. If you add more shortcuts, follow the same pattern — no parallel codepaths.
+The `income` subcommand is a shortcut that builds two specific entries (`checking:asset:N`, `income:income:-N`) and routes them through the same `execute_transaction` helper as `add`. If you add more shortcuts, follow the same pattern — no parallel codepaths. `close` and `open` are shortcuts in the same vein: `close` zeroes every nonzero income/expense balance into `equity/net`; `open` plugs the balancing difference of known opening balances into `equity/net` and refuses a non-empty db. Fiscal-year closes are detected structurally by `model::detect_closes` (nominal + equity entries only, leaving every nominal account at zero) — there is deliberately no schema marker, so closes survive `reconstruct --all` rebuilds. `audit --fy YEAR|latest` resolves its period from the detected closes.
 
 ## Things to be careful about
 
@@ -90,5 +90,5 @@ The `income` subcommand is a shortcut that builds two specific entries (`checkin
 ## When you're stuck
 
 - Read the relevant module's `impl` block first — `model.rs::Transaction` and `storage.rs::Storage` carry the most weight and the most comments-via-naming.
-- The accounting identity (`Σ Assets − Σ Liabilities = Σ Income − Σ Expenses`) is a good test oracle. If you can write a transaction that breaks it, you've found a bug.
+- The accounting identity (`Σ Assets − Σ Liabilities − Σ Equity = Σ Income − Σ Expenses`) is a good test oracle. If you can write a transaction that breaks it, you've found a bug.
 - The user reads diffs carefully. Small focused commits are appreciated. Don't refactor unrelated code in the same change.
