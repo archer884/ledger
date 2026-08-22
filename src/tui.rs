@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io::{self, Stdout};
+use std::str::FromStr;
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
@@ -46,6 +47,8 @@ enum InputMode {
     DeleteConfirm,
     EditAccounts,
     EditAccountsConfirm,
+    AddTransaction,
+    AddConfirm,
     Reconstruct,
     Help,
 }
@@ -58,6 +61,41 @@ struct EditAccountsState {
     entries: Vec<Entry>,
     buffers: Vec<String>,
     selected: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AddField {
+    From,
+    To,
+    Amount,
+    Memo,
+}
+
+impl AddField {
+    fn next(self) -> Self {
+        match self {
+            Self::From => Self::To,
+            Self::To => Self::Amount,
+            Self::Amount => Self::Memo,
+            Self::Memo => Self::From,
+        }
+    }
+}
+
+const ADD_LIST_VISIBLE: usize = 7;
+
+#[derive(Debug, Clone)]
+struct AddTransactionState {
+    accounts: Vec<AccountId>,
+    from_index: usize,
+    to_index: usize,
+    from_offset: usize,
+    to_offset: usize,
+    amount: String,
+    memo: String,
+    focus: AddField,
+    error: Option<String>,
+    entries: Vec<Entry>,
 }
 
 struct App {
@@ -73,6 +111,7 @@ struct App {
     input_buffer: String,
     status: String,
     edit_accounts: Option<EditAccountsState>,
+    add_transaction: Option<AddTransactionState>,
     reconstruct_cmd: Option<String>,
 }
 
@@ -91,6 +130,7 @@ impl App {
             input_buffer: String::new(),
             status: String::new(),
             edit_accounts: None,
+            add_transaction: None,
             reconstruct_cmd: None,
         };
         app.load()?;
@@ -297,6 +337,92 @@ impl App {
         }
     }
 
+    fn start_add(&mut self) {
+        let accounts: Vec<AccountId> = self
+            .accounts_with_balances
+            .iter()
+            .map(|(a, _)| a.id.clone())
+            .collect();
+        let to_index = accounts.len().min(2).saturating_sub(1);
+        self.add_transaction = Some(AddTransactionState {
+            accounts,
+            from_index: 0,
+            to_index,
+            from_offset: 0,
+            to_offset: 0,
+            amount: String::new(),
+            memo: String::new(),
+            focus: AddField::From,
+            error: None,
+            entries: Vec::new(),
+        });
+        self.input_mode = InputMode::AddTransaction;
+    }
+
+    fn preview_add(&mut self) {
+        let Some(state) = self.add_transaction.as_mut() else {
+            self.input_mode = InputMode::Normal;
+            return;
+        };
+        if state.accounts.len() < 2 {
+            state.error = Some("need at least two registered accounts".to_string());
+            return;
+        }
+        let (Some(from), Some(to)) = (
+            state.accounts.get(state.from_index),
+            state.accounts.get(state.to_index),
+        ) else {
+            state.error = Some("pick an account in both lists".to_string());
+            return;
+        };
+        match build_add_entries(from, to, &state.amount) {
+            Ok(entries) => {
+                state.entries = entries;
+                state.error = None;
+                self.input_mode = InputMode::AddConfirm;
+            }
+            Err(e) => {
+                state.error = Some(e);
+            }
+        }
+    }
+
+    fn confirm_add(&mut self) {
+        let Some(state) = self.add_transaction.take() else {
+            self.input_mode = InputMode::Normal;
+            return;
+        };
+        let tx = match Transaction::new(
+            TransactionId::new(),
+            today_timestamp(),
+            state.memo,
+            state.entries,
+        ) {
+            Ok(t) => t,
+            Err(e) => {
+                self.status = format!("invalid transaction: {e}");
+                self.input_mode = InputMode::Normal;
+                return;
+            }
+        };
+        match self.storage.save_transaction(&tx) {
+            Ok(()) => {
+                self.reload_after("transaction added");
+            }
+            Err(e) => {
+                self.status = format!("add failed: {e}");
+                self.input_mode = InputMode::Normal;
+            }
+        }
+    }
+
+    fn class_of(&self, id: &AccountId) -> Option<AccountClass> {
+        self.accounts_with_balances
+            .iter()
+            .find(|(a, _)| &a.id == id)
+            .map(|(a, _)| a.class)
+    }
+
     fn start_reconstruct(&mut self) {
         let Some(tx) = self.selected_transaction() else {
             return;
@@ -373,6 +499,8 @@ impl App {
             InputMode::DeleteConfirm => "Delete this transaction? (y/n)".to_string(),
             InputMode::EditAccounts => "C: edit accounts  j/k: select entry  type to edit account  Enter: confirm  Esc: cancel".to_string(),
             InputMode::EditAccountsConfirm => "Apply account changes? (y/n)".to_string(),
+            InputMode::AddTransaction => "a: add  Tab: next field  j/k: pick account  Enter: preview  Esc: cancel".to_string(),
+            InputMode::AddConfirm => "Save this transaction? (y/n)".to_string(),
             InputMode::Reconstruct | InputMode::Help => "any key to close".to_string(),
         }
     }
@@ -434,6 +562,8 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         InputMode::DeleteConfirm => handle_delete_confirm_key(app, key),
         InputMode::EditAccounts => handle_edit_accounts_key(app, key),
         InputMode::EditAccountsConfirm => handle_edit_accounts_confirm_key(app, key),
+        InputMode::AddTransaction => handle_add_transaction_key(app, key),
+        InputMode::AddConfirm => handle_add_confirm_key(app, key),
         InputMode::Reconstruct => handle_reconstruct_key(app, key),
         InputMode::Help => handle_help_key(app, key),
     }
@@ -475,6 +605,10 @@ fn handle_normal_key(app: &mut App, key: KeyEvent) -> bool {
         }
         KeyCode::Char('r') => {
             app.reload();
+            false
+        }
+        KeyCode::Char('a') => {
+            app.start_add();
             false
         }
         KeyCode::Char('D') => {
@@ -526,6 +660,8 @@ fn handle_input_key(app: &mut App, key: KeyEvent) -> bool {
                 | InputMode::DeleteConfirm
                 | InputMode::EditAccounts
                 | InputMode::EditAccountsConfirm
+                | InputMode::AddTransaction
+                | InputMode::AddConfirm
                 | InputMode::Reconstruct
                 | InputMode::Help => unreachable!(),
             }
@@ -630,6 +766,117 @@ fn handle_edit_accounts_confirm_key(app: &mut App, key: KeyEvent) -> bool {
     }
 }
 
+fn handle_add_transaction_key(app: &mut App, key: KeyEvent) -> bool {
+    let Some(state) = app.add_transaction.as_mut() else {
+        app.input_mode = InputMode::Normal;
+        return false;
+    };
+    let list_len = state.accounts.len();
+    match key.code {
+        KeyCode::Tab => {
+            state.focus = state.focus.next();
+            state.error = None;
+            false
+        }
+        KeyCode::Enter => match state.focus {
+            AddField::Memo => {
+                app.preview_add();
+                false
+            }
+            other => {
+                state.focus = other.next();
+                state.error = None;
+                false
+            }
+        },
+        KeyCode::Char('j') | KeyCode::Down
+            if matches!(state.focus, AddField::From | AddField::To) =>
+        {
+            if list_len == 0 {
+                return false;
+            }
+            match state.focus {
+                AddField::From => {
+                    state.from_index = (state.from_index + 1) % list_len;
+                    state.from_offset =
+                        clamp_offset(state.from_index, state.from_offset, ADD_LIST_VISIBLE);
+                }
+                AddField::To => {
+                    state.to_index = (state.to_index + 1) % list_len;
+                    state.to_offset =
+                        clamp_offset(state.to_index, state.to_offset, ADD_LIST_VISIBLE);
+                }
+                _ => {}
+            }
+            false
+        }
+        KeyCode::Char('k') | KeyCode::Up
+            if matches!(state.focus, AddField::From | AddField::To) =>
+        {
+            if list_len == 0 {
+                return false;
+            }
+            match state.focus {
+                AddField::From => {
+                    state.from_index = state.from_index.checked_sub(1).unwrap_or(list_len - 1);
+                    state.from_offset =
+                        clamp_offset(state.from_index, state.from_offset, ADD_LIST_VISIBLE);
+                }
+                AddField::To => {
+                    state.to_index = state.to_index.checked_sub(1).unwrap_or(list_len - 1);
+                    state.to_offset =
+                        clamp_offset(state.to_index, state.to_offset, ADD_LIST_VISIBLE);
+                }
+                _ => {}
+            }
+            false
+        }
+        KeyCode::Backspace => {
+            state.error = None;
+            match state.focus {
+                AddField::Amount => {
+                    state.amount.pop();
+                }
+                AddField::Memo => {
+                    state.memo.pop();
+                }
+                AddField::From | AddField::To => {}
+            }
+            false
+        }
+        KeyCode::Esc => {
+            app.add_transaction = None;
+            app.input_mode = InputMode::Normal;
+            app.status = "add cancelled".to_string();
+            false
+        }
+        KeyCode::Char(c) if matches!(state.focus, AddField::Amount | AddField::Memo) => {
+            state.error = None;
+            match state.focus {
+                AddField::Amount => state.amount.push(c),
+                AddField::Memo => state.memo.push(c),
+                AddField::From | AddField::To => {}
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+fn handle_add_confirm_key(app: &mut App, key: KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Char('y' | 'Y') => {
+            app.confirm_add();
+            false
+        }
+        KeyCode::Char('n' | 'N') | KeyCode::Esc => {
+            app.input_mode = InputMode::AddTransaction;
+            false
+        }
+        _ => false,
+    }
+}
+
 fn handle_reconstruct_key(app: &mut App, _key: KeyEvent) -> bool {
     app.close_reconstruct();
     false
@@ -654,6 +901,53 @@ fn parse_date_input(s: &str) -> Option<Timestamp> {
         .to_zoned(TimeZone::UTC)
         .ok()
         .map(|z| z.timestamp())
+}
+
+fn today_timestamp() -> Timestamp {
+    jiff::Zoned::now()
+        .date()
+        .at(0, 0, 0, 0)
+        .to_zoned(TimeZone::UTC)
+        .expect("midnight UTC is never ambiguous")
+        .timestamp()
+}
+
+/// Build the two entries for the TUI add form: `-amount` on the `from`
+/// account (the source) and `+amount` on the `to` account (the
+/// destination). The accounts must differ and the amount must parse as
+/// a nonzero `Decimal`.
+fn build_add_entries(from: &AccountId, to: &AccountId, amount: &str) -> Result<Vec<Entry>, String> {
+    if from == to {
+        return Err("from and to accounts must differ".to_string());
+    }
+    let amount =
+        Decimal::from_str(amount.trim()).map_err(|e| format!("invalid amount {amount:?}: {e}"))?;
+    if amount == Decimal::ZERO {
+        return Err("amount must be nonzero".to_string());
+    }
+    Ok(vec![
+        Entry {
+            account: from.clone(),
+            amount: -amount,
+        },
+        Entry {
+            account: to.clone(),
+            amount,
+        },
+    ])
+}
+
+/// Keep a list window scrolled so `selected` stays visible within
+/// `visible` rows starting at `offset`.
+#[must_use]
+fn clamp_offset(selected: usize, offset: usize, visible: usize) -> usize {
+    if selected < offset {
+        selected
+    } else if selected >= offset + visible {
+        selected + 1 - visible
+    } else {
+        offset
+    }
 }
 
 fn ui(f: &mut ratatui::Frame, app: &mut App) {
@@ -750,6 +1044,9 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
         InputMode::EditAccounts | InputMode::EditAccountsConfirm => {
             render_edit_accounts_modal(f, app);
         }
+        InputMode::AddTransaction | InputMode::AddConfirm => {
+            render_add_modal(f, app);
+        }
         InputMode::Reconstruct => {
             render_reconstruct_modal(f, app);
         }
@@ -764,7 +1061,7 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length((area.height - height) / 2),
+            Constraint::Length(area.height.saturating_sub(height) / 2),
             Constraint::Length(height),
             Constraint::Min(0),
         ])
@@ -772,7 +1069,7 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     let horizontal = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Length((area.width - width) / 2),
+            Constraint::Length(area.width.saturating_sub(width) / 2),
             Constraint::Length(width),
             Constraint::Min(0),
         ])
@@ -849,6 +1146,164 @@ fn render_edit_accounts_modal(f: &mut ratatui::Frame, app: &App) {
     f.render_widget(paragraph, area);
 }
 
+fn render_add_modal(f: &mut ratatui::Frame, app: &App) {
+    let Some(state) = &app.add_transaction else {
+        return;
+    };
+    if app.input_mode == InputMode::AddConfirm {
+        render_add_confirm_modal(f, app, state);
+    } else {
+        render_add_form_modal(f, state);
+    }
+}
+
+fn render_add_confirm_modal(f: &mut ratatui::Frame, app: &App, state: &AddTransactionState) {
+    let mut content = Vec::new();
+    for entry in &state.entries {
+        let class = app
+            .class_of(&entry.account)
+            .map_or_else(String::new, |c| format!(" ({c:?})"))
+            .to_lowercase();
+        content.push(Line::from(vec![
+            Span::raw(format!("  {:<24}", entry.account.to_string())),
+            Span::raw(format!("{:>12}{class}", format!("{:+.2}", entry.amount))),
+        ]));
+    }
+    if !state.memo.is_empty() {
+        content.push(Line::raw(format!("  memo: {}", state.memo)));
+    }
+    content.push(Line::raw(""));
+    content.push(Line::raw("  Posts today").style(Style::default().add_modifier(Modifier::DIM)));
+    let area = centered_rect(48, 8, f.area());
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .title("Add transaction — Save? (y/n)");
+    let paragraph = Paragraph::new(content).block(block);
+    f.render_widget(paragraph, area);
+}
+
+fn render_add_form_modal(f: &mut ratatui::Frame, state: &AddTransactionState) {
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let bold = Style::default().add_modifier(Modifier::BOLD);
+    let reversed = Style::default().add_modifier(Modifier::REVERSED);
+
+    let from_focused = state.focus == AddField::From;
+    let to_focused = state.focus == AddField::To;
+
+    let header = Line::from(vec![
+        Span::raw("  "),
+        Span::styled(
+            format!("{:<28}", "FROM (-)"),
+            if from_focused { reversed } else { bold },
+        ),
+        Span::raw("  "),
+        Span::styled(
+            format!("{:<28}", "TO (+)"),
+            if to_focused { reversed } else { bold },
+        ),
+    ]);
+
+    let pane_rows =
+        |ids: &[AccountId], selected: usize, offset: usize, focused: bool| -> Vec<(String, bool)> {
+            let end = (offset + ADD_LIST_VISIBLE).min(ids.len());
+            (offset..end)
+                .map(|i| {
+                    let marker = if i == selected { "> " } else { "  " };
+                    (
+                        format!("{marker}{:<26.26}", ids[i].as_str()),
+                        i == selected && focused,
+                    )
+                })
+                .collect()
+        };
+
+    let left_rows = pane_rows(
+        &state.accounts,
+        state.from_index,
+        state.from_offset,
+        from_focused,
+    );
+    let right_rows = pane_rows(&state.accounts, state.to_index, state.to_offset, to_focused);
+
+    let mut content = vec![header];
+    for r in 0..ADD_LIST_VISIBLE {
+        let (left, left_hot) = left_rows
+            .get(r)
+            .map_or((String::new(), false), |(s, hot)| ((*s).clone(), *hot));
+        let (right, right_hot) = right_rows
+            .get(r)
+            .map_or((String::new(), false), |(s, hot)| ((*s).clone(), *hot));
+        content.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(format!("{left:<28}"), if left_hot { reversed } else { dim }),
+            Span::raw("  "),
+            Span::styled(
+                format!("{right:<28}"),
+                if right_hot { reversed } else { dim },
+            ),
+        ]));
+    }
+
+    content.push(Line::raw(""));
+
+    let field = |label: &str, buffer: &str| -> Line {
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                format!("{label:<10}"),
+                Style::default().add_modifier(Modifier::DIM),
+            ),
+            Span::raw(buffer.to_string()),
+        ])
+    };
+
+    content.push(field("amount", &state.amount));
+    content.push(field("memo", &state.memo));
+    content.push(Line::raw(""));
+
+    if let Some(error) = &state.error {
+        content.push(Line::raw(format!("  {error}")));
+    } else {
+        content.push(Line::raw(""));
+    }
+    content.push(
+        Line::raw("  Tab: next field  j/k: pick account  Enter: preview  Esc: cancel").style(dim),
+    );
+
+    let area = centered_rect(64, 16, f.area());
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .title("Add transaction");
+    let inner = block.inner(area);
+    let paragraph = Paragraph::new(content).block(block);
+    f.render_widget(paragraph, area);
+
+    // Put the terminal's own cursor right after the focused text so the
+    // input looks native. Layout: row 0 is the pane header, rows
+    // 1..=ADD_LIST_VISIBLE are the account lists, then a blank row, then
+    // the amount and memo fields. Text starts 2 cells in plus the
+    // 10-wide label column.
+    if matches!(state.focus, AddField::Amount | AddField::Memo) {
+        // Typed characters are single-width and the row indices are tiny;
+        // truncation from usize is not a real concern here.
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            let (buffer, row) = if state.focus == AddField::Amount {
+                (&state.amount, ADD_LIST_VISIBLE + 2)
+            } else {
+                (&state.memo, ADD_LIST_VISIBLE + 3)
+            };
+            let typed_width = buffer.chars().count() as u16;
+            let x = (inner.x + 12 + typed_width).min(inner.right().saturating_sub(1));
+            f.set_cursor_position((x, inner.y + row as u16));
+        }
+    }
+}
+
 fn render_reconstruct_modal(f: &mut ratatui::Frame, app: &App) {
     let Some(cmd) = &app.reconstruct_cmd else {
         return;
@@ -898,6 +1353,7 @@ fn render_help_modal(f: &mut ratatui::Frame) {
         row("c", "clear all filters"),
         Line::raw(""),
         header("Transaction"),
+        row("a", "add transaction (y/n to confirm)"),
         row("y", "copy the ledger add command to the clipboard"),
         row("C", "edit accounts (y/n to apply)"),
         row("D", "delete (y/n to confirm)"),
@@ -917,4 +1373,263 @@ fn render_help_modal(f: &mut ratatui::Frame) {
         .title("Keyboard shortcuts (any key to close)");
     let paragraph = Paragraph::new(content).block(block);
     f.render_widget(paragraph, area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::Backend as _;
+
+    fn acct_id(s: &str) -> AccountId {
+        AccountId::parse(s).expect("account parses")
+    }
+
+    #[test]
+    fn build_add_entries_builds_signed_pair() {
+        let entries =
+            build_add_entries(&acct_id("income/dues"), &acct_id("general"), "60").expect("ok");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].account.as_str(), "income/dues");
+        assert_eq!(entries[0].amount, Decimal::from(-60));
+        assert_eq!(entries[1].account.as_str(), "general");
+        assert_eq!(entries[1].amount, Decimal::from(60));
+        let sum: Decimal = entries.iter().map(|e| e.amount).sum();
+        assert_eq!(sum, Decimal::ZERO);
+    }
+
+    #[test]
+    fn build_add_entries_accepts_decimal_amounts() {
+        let entries =
+            build_add_entries(&acct_id("general"), &acct_id("expense/city"), "154.56").expect("ok");
+        assert_eq!(entries[0].amount, Decimal::from_str("-154.56").unwrap());
+        assert_eq!(entries[1].amount, Decimal::from_str("154.56").unwrap());
+    }
+
+    #[test]
+    fn build_add_entries_rejects_same_account() {
+        let err =
+            build_add_entries(&acct_id("general"), &acct_id("general"), "60").expect_err("same");
+        assert!(err.contains("must differ"), "{err}");
+    }
+
+    #[test]
+    fn build_add_entries_rejects_bad_or_zero_amount() {
+        let from = acct_id("general");
+        let to = acct_id("income/dues");
+        let err = build_add_entries(&from, &to, "abc").expect_err("bad");
+        assert!(err.contains("invalid amount"), "{err}");
+        let err = build_add_entries(&from, &to, "0").expect_err("zero");
+        assert!(err.contains("nonzero"), "{err}");
+    }
+
+    #[test]
+    fn clamp_offset_follows_selection() {
+        assert_eq!(clamp_offset(2, 5, 7), 2);
+        assert_eq!(clamp_offset(9, 0, 7), 3);
+        assert_eq!(clamp_offset(4, 3, 7), 3);
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn type_str(app: &mut App, s: &str) {
+        for c in s.chars() {
+            handle_key(app, key(KeyCode::Char(c)));
+        }
+    }
+
+    fn seeded_app() -> App {
+        let storage = Storage::in_memory().expect("in-memory db");
+        for (id, class) in [
+            ("general", AccountClass::Asset),
+            ("income/dues", AccountClass::Income),
+            ("expense/city", AccountClass::Expense),
+        ] {
+            storage
+                .register_account(&Account {
+                    id: AccountId::parse(id).expect("account parses"),
+                    class,
+                })
+                .expect("registered");
+        }
+        App::new(storage).expect("app loads")
+    }
+
+    #[test]
+    fn add_flow_end_to_end() {
+        let mut app = seeded_app();
+
+        handle_key(&mut app, key(KeyCode::Char('a')));
+        assert_eq!(app.input_mode, InputMode::AddTransaction);
+
+        // accounts list is sorted: expense/city(0), general(1), income/dues(2)
+        handle_key(&mut app, key(KeyCode::Char('j')));
+        handle_key(&mut app, key(KeyCode::Char('j')));
+        let state = app.add_transaction.as_ref().expect("state");
+        assert_eq!(state.from_index, 2);
+        assert_eq!(state.accounts[state.from_index].as_str(), "income/dues");
+
+        handle_key(&mut app, key(KeyCode::Tab));
+        let state = app.add_transaction.as_ref().expect("state");
+        assert_eq!(state.to_index, 1);
+        assert_eq!(state.accounts[state.to_index].as_str(), "general");
+
+        handle_key(&mut app, key(KeyCode::Tab));
+        type_str(&mut app, "60");
+        handle_key(&mut app, key(KeyCode::Tab));
+        type_str(&mut app, "Dues deposit");
+        handle_key(&mut app, key(KeyCode::Enter));
+
+        assert_eq!(app.input_mode, InputMode::AddConfirm);
+        let state = app.add_transaction.as_ref().expect("state kept");
+        assert_eq!(state.entries.len(), 2);
+        assert_eq!(state.entries[0].account.as_str(), "income/dues");
+        assert_eq!(state.entries[0].amount, Decimal::from(-60));
+        assert_eq!(state.entries[1].account.as_str(), "general");
+        assert_eq!(state.entries[1].amount, Decimal::from(60));
+
+        handle_key(&mut app, key(KeyCode::Char('y')));
+        assert_eq!(app.input_mode, InputMode::Normal);
+        assert_eq!(app.status, "transaction added");
+
+        let transactions = app.storage.list_transactions().expect("list works");
+        assert_eq!(transactions.len(), 1);
+        assert_eq!(transactions[0].memo, "Dues deposit");
+        let sum: Decimal = transactions[0].entries.iter().map(|e| e.amount).sum();
+        assert_eq!(sum, Decimal::ZERO);
+    }
+
+    #[test]
+    fn add_flow_decline_returns_to_form_and_escape_cancels() {
+        let mut app = seeded_app();
+
+        handle_key(&mut app, key(KeyCode::Char('a')));
+        handle_key(&mut app, key(KeyCode::Tab));
+        handle_key(&mut app, key(KeyCode::Tab));
+        type_str(&mut app, "60");
+        handle_key(&mut app, key(KeyCode::Tab));
+        handle_key(&mut app, key(KeyCode::Enter));
+        assert_eq!(app.input_mode, InputMode::AddConfirm);
+
+        handle_key(&mut app, key(KeyCode::Char('n')));
+        assert_eq!(app.input_mode, InputMode::AddTransaction);
+
+        handle_key(&mut app, key(KeyCode::Esc));
+        assert_eq!(app.input_mode, InputMode::Normal);
+        assert!(
+            app.storage
+                .list_transactions()
+                .expect("list works")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn add_flow_enter_on_from_list_advances_focus() {
+        let mut app = seeded_app();
+        handle_key(&mut app, key(KeyCode::Char('a')));
+        handle_key(&mut app, key(KeyCode::Enter));
+        let state = app.add_transaction.as_ref().expect("state");
+        assert_eq!(state.focus, AddField::To);
+        assert_eq!(app.input_mode, InputMode::AddTransaction);
+    }
+
+    #[test]
+    fn add_flow_jk_type_in_text_fields_not_lists() {
+        let mut app = seeded_app();
+        handle_key(&mut app, key(KeyCode::Char('a')));
+        handle_key(&mut app, key(KeyCode::Tab));
+        handle_key(&mut app, key(KeyCode::Tab));
+        type_str(&mut app, "j60k");
+        let state = app.add_transaction.as_ref().expect("state");
+        assert_eq!(state.amount, "j60k");
+    }
+
+    #[test]
+    fn add_flow_validation_error_keeps_form_open() {
+        let mut app = seeded_app();
+        handle_key(&mut app, key(KeyCode::Char('a')));
+        // from defaults to index 0; select index 0 on the TO list too
+        handle_key(&mut app, key(KeyCode::Tab));
+        handle_key(&mut app, key(KeyCode::Char('k')));
+        handle_key(&mut app, key(KeyCode::Tab));
+        type_str(&mut app, "60");
+        handle_key(&mut app, key(KeyCode::Tab));
+        handle_key(&mut app, key(KeyCode::Enter));
+        assert_eq!(app.input_mode, InputMode::AddTransaction);
+        let state = app.add_transaction.as_ref().expect("state");
+        let error = state.error.as_deref().expect("error set");
+        assert!(error.contains("must differ"), "{error}");
+    }
+
+    fn buffer_text(terminal: &Terminal<ratatui::backend::TestBackend>) -> String {
+        let mut text = String::new();
+        for cell in terminal.backend().buffer().content() {
+            text.push(cell.symbol().chars().next().unwrap_or(' '));
+        }
+        text
+    }
+
+    #[test]
+    fn render_add_modal_smoke() {
+        let mut app = seeded_app();
+        handle_key(&mut app, key(KeyCode::Char('a')));
+
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal.draw(|f| ui(f, &mut app)).expect("renders");
+        let text = buffer_text(&terminal);
+        assert!(text.contains("Add transaction"), "title missing");
+        assert!(text.contains("FROM"), "FROM pane missing");
+        assert!(text.contains("TO"), "TO pane missing");
+        assert!(text.contains("amount"), "amount field missing");
+        assert!(text.contains("memo"), "memo field missing");
+        assert!(text.contains("income/dues"), "account list missing");
+
+        handle_key(&mut app, key(KeyCode::Char('j')));
+        handle_key(&mut app, key(KeyCode::Char('j')));
+        handle_key(&mut app, key(KeyCode::Tab));
+        handle_key(&mut app, key(KeyCode::Tab));
+        type_str(&mut app, "60");
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal.draw(|f| ui(f, &mut app)).expect("renders");
+        let text = buffer_text(&terminal);
+        assert!(!text.contains('|'), "fake cursor char leaked: {text}");
+
+        // Terminal cursor sits right after "60" in the amount field:
+        // modal inner starts at x=9 (80/64 centering + border), text at
+        // +12 (indent + label column), +2 typed chars; row 9 of the
+        // inner area (header + 7 list rows + blank).
+        let pos = terminal
+            .backend_mut()
+            .get_cursor_position()
+            .expect("cursor position set");
+        assert_eq!((pos.x, pos.y), (23, 14), "cursor not after amount text");
+
+        handle_key(&mut app, key(KeyCode::Tab));
+        type_str(&mut app, "Dues");
+        handle_key(&mut app, key(KeyCode::Enter));
+        assert_eq!(app.input_mode, InputMode::AddConfirm);
+
+        terminal.draw(|f| ui(f, &mut app)).expect("renders");
+        let text = buffer_text(&terminal);
+        assert!(
+            text.contains("memo: Dues"),
+            "memo missing in preview: {text}"
+        );
+    }
+
+    #[test]
+    fn render_add_modal_survives_tiny_terminal() {
+        let mut app = seeded_app();
+        handle_key(&mut app, key(KeyCode::Char('a')));
+
+        let backend = ratatui::backend::TestBackend::new(1, 1);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|f| ui(f, &mut app))
+            .expect("no underflow on a zero-sized modal area");
+    }
 }
