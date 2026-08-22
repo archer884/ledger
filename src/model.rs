@@ -126,18 +126,83 @@ pub struct Entry {
     pub amount: Decimal,
 }
 
+/// What role a transaction plays in the book. `Normal` is the overwhelming
+/// majority; the other two are period boundaries, posted by `ledger close`
+/// and `ledger open`.
+///
+/// This is recorded rather than inferred. Working it out from the entry
+/// structure after the fact is possible but fragile — it depends on reading
+/// transactions in posted order, which same-day ties cannot guarantee.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum TransactionKind {
+    #[default]
+    Normal,
+    Close,
+    Open,
+}
+
+impl TransactionKind {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Close => "close",
+            Self::Open => "open",
+        }
+    }
+
+    /// Both ends of a fiscal period. A summary treats them alike: each one
+    /// starts a fresh period, and `Open` additionally means nothing precedes
+    /// it.
+    #[must_use]
+    pub fn is_boundary(self) -> bool {
+        matches!(self, Self::Close | Self::Open)
+    }
+
+    /// # Errors
+    ///
+    /// Returns `TransactionError::UnknownKind` if `s` is not a known kind.
+    pub fn parse(s: &str) -> Result<Self, TransactionError> {
+        match s {
+            "normal" => Ok(Self::Normal),
+            "close" => Ok(Self::Close),
+            "open" => Ok(Self::Open),
+            other => Err(TransactionError::UnknownKind(other.to_string())),
+        }
+    }
+}
+
+impl std::fmt::Display for TransactionKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Transaction {
     pub id: TransactionId,
     pub posted_at: Timestamp,
     pub memo: String,
     pub entries: Vec<Entry>,
+    pub kind: TransactionKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransactionError {
-    TooFewEntries { got: usize, min: usize },
-    Unbalanced { sum: Decimal },
+    TooFewEntries {
+        got: usize,
+        min: usize,
+    },
+    Unbalanced {
+        sum: Decimal,
+    },
+    UnknownKind(String),
+    UnknownAccount(AccountId),
+    WrongShape {
+        kind: TransactionKind,
+        account: AccountId,
+        class: AccountClass,
+    },
 }
 
 impl std::fmt::Display for TransactionError {
@@ -148,6 +213,38 @@ impl std::fmt::Display for TransactionError {
             }
             Self::Unbalanced { sum } => {
                 write!(f, "entries do not sum to zero; sum is {sum}")
+            }
+            Self::UnknownKind(s) => {
+                write!(
+                    f,
+                    "unknown transaction kind {s:?} (expected normal, close, or open)"
+                )
+            }
+            Self::UnknownAccount(id) => write!(f, "unknown account: {id}"),
+            Self::WrongShape {
+                kind,
+                account,
+                class,
+            } => {
+                let (subject, rule) = match kind {
+                    TransactionKind::Close => (
+                        "a close",
+                        "a close moves income and expense balances into equity",
+                    ),
+                    TransactionKind::Open => (
+                        "an open",
+                        "an open records asset and liability balances against equity",
+                    ),
+                    TransactionKind::Normal => (
+                        "a normal transaction",
+                        "normal transactions have no restriction",
+                    ),
+                };
+                write!(
+                    f,
+                    "{subject} cannot touch {account} ({}); {rule}",
+                    class_to_str(*class),
+                )
             }
         }
     }
@@ -182,7 +279,52 @@ impl Transaction {
             posted_at,
             memo,
             entries,
+            kind: TransactionKind::Normal,
         })
+    }
+
+    /// Record this transaction as a period boundary.
+    ///
+    /// The kind is checked against the entries so a stored marker can never
+    /// describe a transaction that isn't shaped like one: a close only moves
+    /// nominal balances into equity, an open only records real balances
+    /// against equity.
+    ///
+    /// # Errors
+    ///
+    /// Returns `TransactionError::UnknownAccount` if an entry names an
+    /// account missing from `classes`, or `TransactionError::WrongShape` if
+    /// an entry's class is not allowed for `kind`.
+    pub fn with_kind(
+        mut self,
+        kind: TransactionKind,
+        classes: &HashMap<AccountId, AccountClass>,
+    ) -> Result<Self, TransactionError> {
+        for entry in &self.entries {
+            let class = *classes
+                .get(&entry.account)
+                .ok_or_else(|| TransactionError::UnknownAccount(entry.account.clone()))?;
+            let allowed = match kind {
+                TransactionKind::Normal => true,
+                TransactionKind::Close => matches!(
+                    class,
+                    AccountClass::Income | AccountClass::Expense | AccountClass::Equity
+                ),
+                TransactionKind::Open => matches!(
+                    class,
+                    AccountClass::Asset | AccountClass::Liability | AccountClass::Equity
+                ),
+            };
+            if !allowed {
+                return Err(TransactionError::WrongShape {
+                    kind,
+                    account: entry.account.clone(),
+                    class,
+                });
+            }
+        }
+        self.kind = kind;
+        Ok(self)
     }
 
     pub(crate) fn from_raw(
@@ -190,12 +332,14 @@ impl Transaction {
         posted_at: Timestamp,
         memo: String,
         entries: Vec<Entry>,
+        kind: TransactionKind,
     ) -> Self {
         Self {
             id,
             posted_at,
             memo,
             entries,
+            kind,
         }
     }
 
@@ -225,8 +369,11 @@ impl Transaction {
         classes: &HashMap<AccountId, AccountClass>,
     ) -> Result<String, ReconstructError> {
         let date = self.posted_at.to_zoned(TimeZone::UTC).date().to_string();
-        let mut parts: Vec<String> = Vec::with_capacity(2 + self.entries.len());
+        let mut parts: Vec<String> = Vec::with_capacity(3 + self.entries.len());
         parts.push(format!("ledger add --date {date}"));
+        if self.kind != TransactionKind::Normal {
+            parts.push(format!("--kind {}", self.kind));
+        }
         if !self.memo.is_empty() {
             parts.push(format!("--memo {}", shell_quote(&self.memo)));
         }
@@ -286,76 +433,68 @@ pub struct CloseInfo {
     pub posted_at: Timestamp,
 }
 
-/// Identify the fiscal-year closing transactions in a ledger.
+/// Every fiscal-year close in the book, in posted order.
 ///
-/// A transaction is a close iff it posts to at least one income or
-/// expense account, every one of its remaining entries posts to an
-/// equity account, and after applying it every income and expense
-/// account in `classes` has an all-time balance of exactly zero.
-/// `transactions` must be in posted order, as returned by
-/// `storage::list_transactions`; balances are tracked across the whole
-/// slice, so closes buried in history are still recognized.
+/// Reads the recorded kind rather than inferring it from entry structure,
+/// so a close stays a close regardless of how it sorts against same-day
+/// transactions.
 #[must_use]
-pub fn detect_closes(
-    transactions: &[Transaction],
-    classes: &HashMap<AccountId, AccountClass>,
-) -> Vec<CloseInfo> {
-    let mut balances: HashMap<AccountId, Decimal> = HashMap::new();
-    let mut closes = Vec::new();
-
-    for tx in transactions {
-        let mut touches_nominal = false;
-        let mut others_all_equity = true;
-        for entry in &tx.entries {
-            match classes.get(&entry.account) {
-                Some(AccountClass::Income | AccountClass::Expense) => {
-                    touches_nominal = true;
-                }
-                Some(AccountClass::Equity) => {}
-                Some(AccountClass::Asset | AccountClass::Liability) | None => {
-                    others_all_equity = false;
-                }
-            }
-        }
-
-        for entry in &tx.entries {
-            *balances
-                .entry(entry.account.clone())
-                .or_insert(Decimal::ZERO) += entry.amount;
-        }
-
-        if !touches_nominal || !others_all_equity {
-            continue;
-        }
-
-        let nominals_zero = classes
-            .iter()
-            .filter(|(_, class)| matches!(class, AccountClass::Income | AccountClass::Expense))
-            .all(|(id, _)| balances.get(id).is_none_or(|b| *b == Decimal::ZERO));
-        if nominals_zero {
-            closes.push(CloseInfo {
-                id: tx.id,
-                posted_at: tx.posted_at,
-            });
-        }
-    }
-    closes
+pub fn closes(transactions: &[Transaction]) -> Vec<CloseInfo> {
+    transactions
+        .iter()
+        .filter(|tx| tx.kind == TransactionKind::Close)
+        .map(|tx| CloseInfo {
+            id: tx.id,
+            posted_at: tx.posted_at,
+        })
+        .collect()
 }
 
-/// Book-level totals rolled up from account balances.
+/// When the current fiscal period began: the most recent close or open.
+///
+/// Both count. A close ends the previous period and starts this one; an open
+/// starts the first period and means nothing precedes it. `None` is a book
+/// with neither, whose period therefore runs over all of history.
+#[must_use]
+pub fn period_start(transactions: &[Transaction]) -> Option<Timestamp> {
+    transactions
+        .iter()
+        .rfind(|tx| tx.kind.is_boundary())
+        .map(|tx| tx.posted_at)
+}
+
+/// Income and expense flow over some period, as positive magnitudes:
+/// `income` is what came in, `expenses` is what went out.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Activity {
+    pub income: Decimal,
+    pub expenses: Decimal,
+}
+
+impl Activity {
+    #[must_use]
+    pub fn net(&self) -> Decimal {
+        self.income - self.expenses
+    }
+}
+
+/// Book-level totals rolled up from account balances: the position half of
+/// the picture, plus whatever activity the nominal accounts currently hold.
 ///
 /// Balances arrive in the ledger's signed convention (positive means the
-/// account went up) and leave in the one a reader expects: `income` and
-/// `expenses` are positive magnitudes, while `liabilities` stays negative
-/// while money is owed, so both reported columns sum on their own —
-/// `assets + liabilities == net_worth()`.
+/// account went up) and leave in the one a reader expects: activity is
+/// reported as positive magnitudes, while `liabilities` stays negative
+/// while money is owed, so `assets + liabilities == net_worth()`.
+///
+/// Because a close zeroes the nominal accounts, `activity` covers only the
+/// period since the last close — the fiscal year to date. For the whole
+/// history see [`lifetime_activity`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Summary {
     pub assets: Decimal,
     pub liabilities: Decimal,
     pub equity: Decimal,
-    pub income: Decimal,
-    pub expenses: Decimal,
+    pub activity: Activity,
 }
 
 impl Summary {
@@ -370,8 +509,8 @@ impl Summary {
                 AccountClass::Asset => summary.assets += balance,
                 AccountClass::Liability => summary.liabilities += balance,
                 AccountClass::Equity => summary.equity += balance,
-                AccountClass::Income => summary.income -= balance,
-                AccountClass::Expense => summary.expenses += balance,
+                AccountClass::Income => summary.activity.income -= balance,
+                AccountClass::Expense => summary.activity.expenses += balance,
             }
         }
         summary
@@ -381,11 +520,34 @@ impl Summary {
     pub fn net_worth(&self) -> Decimal {
         self.assets + self.liabilities
     }
+}
 
-    #[must_use]
-    pub fn net_income(&self) -> Decimal {
-        self.income - self.expenses
+/// Cumulative income and expense flow across the whole history.
+///
+/// Balances alone cannot answer this once a year has been closed: a close
+/// posts nominal entries that exactly offset the period it closes, so the
+/// accounts read zero. This walks the transactions instead, counting only
+/// `Normal` ones so the periods the boundaries retired still show up.
+///
+#[must_use]
+pub fn lifetime_activity(
+    transactions: &[Transaction],
+    classes: &HashMap<AccountId, AccountClass>,
+) -> Activity {
+    let mut activity = Activity::default();
+    for tx in transactions
+        .iter()
+        .filter(|tx| tx.kind == TransactionKind::Normal)
+    {
+        for entry in &tx.entries {
+            match classes.get(&entry.account) {
+                Some(AccountClass::Income) => activity.income -= entry.amount,
+                Some(AccountClass::Expense) => activity.expenses += entry.amount,
+                _ => {}
+            }
+        }
     }
+    activity
 }
 
 impl std::fmt::Display for ReconstructError {
@@ -455,6 +617,22 @@ mod tests {
         .expect("tx balances")
     }
 
+    fn dated(day: &str, memo: &str, entries: Vec<Entry>) -> Transaction {
+        Transaction::new(TransactionId::new(), ts(day), memo.to_string(), entries)
+            .expect("tx balances")
+    }
+
+    fn boundary(
+        day: &str,
+        kind: TransactionKind,
+        entries: Vec<Entry>,
+        classes: &HashMap<AccountId, AccountClass>,
+    ) -> Transaction {
+        dated(day, "", entries)
+            .with_kind(kind, classes)
+            .expect("boundary shape is valid")
+    }
+
     fn classes(pairs: &[(&str, AccountClass)]) -> HashMap<AccountId, AccountClass> {
         pairs
             .iter()
@@ -495,10 +673,18 @@ mod tests {
         let summary = Summary::from_balances(open_book());
         assert_eq!(summary.assets, dec("1500"));
         assert_eq!(summary.liabilities, dec("-265.44"));
-        assert_eq!(summary.income, dec("2000"), "income flips to positive");
-        assert_eq!(summary.expenses, dec("765.44"), "expenses stay positive");
+        assert_eq!(
+            summary.activity.income,
+            dec("2000"),
+            "income flips to positive"
+        );
+        assert_eq!(
+            summary.activity.expenses,
+            dec("765.44"),
+            "expenses stay positive"
+        );
         assert_eq!(summary.net_worth(), dec("1234.56"));
-        assert_eq!(summary.net_income(), dec("1234.56"));
+        assert_eq!(summary.activity.net(), dec("1234.56"));
     }
 
     #[test]
@@ -510,7 +696,7 @@ mod tests {
             (AccountClass::Expense, dec("465.44")),
         ]);
         assert_eq!(summary.assets, dec("1500"));
-        assert_eq!(summary.expenses, dec("765.44"));
+        assert_eq!(summary.activity.expenses, dec("765.44"));
     }
 
     #[test]
@@ -518,7 +704,7 @@ mod tests {
         let summary = Summary::from_balances(vec![]);
         assert_eq!(summary, Summary::default());
         assert_eq!(summary.net_worth(), Decimal::ZERO);
-        assert_eq!(summary.net_income(), Decimal::ZERO);
+        assert_eq!(summary.activity.net(), Decimal::ZERO);
     }
 
     /// The accounting identity, restated in the summary's terms: every
@@ -530,7 +716,7 @@ mod tests {
             let summary = Summary::from_balances(balances);
             assert_eq!(
                 summary.net_worth() + summary.equity,
-                summary.net_income(),
+                summary.activity.net(),
                 "identity broken for {summary:?}"
             );
         }
@@ -549,7 +735,134 @@ mod tests {
             (AccountClass::Expense, dec("0")),
         ]);
         assert_eq!(before.net_worth(), after.net_worth());
-        assert_eq!(after.net_income(), Decimal::ZERO);
+        assert_eq!(after.activity.net(), Decimal::ZERO);
+    }
+
+    fn fy_book() -> (Vec<Transaction>, HashMap<AccountId, AccountClass>) {
+        let classes = classes(&[
+            ("checking", AccountClass::Asset),
+            ("salary", AccountClass::Income),
+            ("rent", AccountClass::Expense),
+            ("equity/net", AccountClass::Equity),
+        ]);
+        let transactions = vec![
+            tx(
+                "Paycheck",
+                vec![entry("checking", "1000"), entry("salary", "-1000")],
+            ),
+            tx(
+                "Rent",
+                vec![entry("checking", "-400"), entry("rent", "400")],
+            ),
+            dated(
+                "2024-01-15",
+                "FY close",
+                vec![
+                    entry("salary", "1000"),
+                    entry("rent", "-400"),
+                    entry("equity/net", "-600"),
+                ],
+            )
+            .with_kind(TransactionKind::Close, &classes)
+            .expect("close shape is valid"),
+            tx(
+                "Paycheck",
+                vec![entry("checking", "1200"), entry("salary", "-1200")],
+            ),
+        ];
+        (transactions, classes)
+    }
+
+    /// The close is skipped, so the year it retired still counts.
+    #[test]
+    fn lifetime_activity_counts_through_closes() {
+        let (transactions, classes) = fy_book();
+        assert_eq!(closes(&transactions).len(), 1, "close not marked");
+
+        let lifetime = lifetime_activity(&transactions, &classes);
+        assert_eq!(lifetime.income, dec("2200"), "both paychecks");
+        assert_eq!(lifetime.expenses, dec("400"));
+        assert_eq!(lifetime.net(), dec("1800"));
+    }
+
+    /// The balance-derived activity only sees the period since the close,
+    /// which is exactly what makes the two views worth toggling between.
+    #[test]
+    fn lifetime_activity_exceeds_the_current_fiscal_year() {
+        let (transactions, classes) = fy_book();
+        let lifetime = lifetime_activity(&transactions, &classes);
+
+        let mut balances: HashMap<AccountId, Decimal> = HashMap::new();
+        for tx in &transactions {
+            for entry in &tx.entries {
+                *balances.entry(entry.account.clone()).or_default() += entry.amount;
+            }
+        }
+        let fiscal_year = Summary::from_balances(
+            balances
+                .iter()
+                .filter_map(|(id, balance)| classes.get(id).map(|class| (*class, *balance))),
+        );
+
+        assert_eq!(fiscal_year.activity.income, dec("1200"), "since the close");
+        assert_eq!(fiscal_year.activity.expenses, Decimal::ZERO);
+        assert_eq!(lifetime.net(), dec("1800"));
+        assert_eq!(fiscal_year.activity.net(), dec("1200"));
+        assert_eq!(
+            fiscal_year.net_worth(),
+            dec("1800"),
+            "net worth is a position, unaffected by which period you view"
+        );
+    }
+
+    /// With no close on the books the two views agree.
+    #[test]
+    fn lifetime_activity_matches_balances_before_any_close() {
+        let classes = classes(&[
+            ("checking", AccountClass::Asset),
+            ("salary", AccountClass::Income),
+            ("rent", AccountClass::Expense),
+        ]);
+        let transactions = vec![
+            tx(
+                "Paycheck",
+                vec![entry("checking", "1000"), entry("salary", "-1000")],
+            ),
+            tx(
+                "Rent",
+                vec![entry("checking", "-400"), entry("rent", "400")],
+            ),
+        ];
+        assert!(closes(&transactions).is_empty());
+
+        let lifetime = lifetime_activity(&transactions, &classes);
+        assert_eq!(lifetime.income, dec("1000"));
+        assert_eq!(lifetime.expenses, dec("400"));
+    }
+
+    /// Opening balances are asset/liability plus an equity plug, so they
+    /// never register as income — "since open" and "all time" agree until
+    /// the first close.
+    #[test]
+    fn lifetime_activity_ignores_opening_balances() {
+        let classes = classes(&[
+            ("checking", AccountClass::Asset),
+            ("equity/net", AccountClass::Equity),
+            ("salary", AccountClass::Income),
+        ]);
+        let transactions = vec![
+            tx(
+                "Opening balances",
+                vec![entry("checking", "5000"), entry("equity/net", "-5000")],
+            ),
+            tx(
+                "Paycheck",
+                vec![entry("checking", "1000"), entry("salary", "-1000")],
+            ),
+        ];
+        let lifetime = lifetime_activity(&transactions, &classes);
+        assert_eq!(lifetime.income, dec("1000"), "the plug is not income");
+        assert_eq!(lifetime.expenses, Decimal::ZERO);
     }
 
     #[test]
@@ -745,11 +1058,6 @@ mod tests {
         );
     }
 
-    fn close(day: &str, entries: Vec<Entry>) -> Transaction {
-        Transaction::new(TransactionId::new(), ts(day), String::new(), entries)
-            .expect("close balances")
-    }
-
     fn fy_classes() -> HashMap<AccountId, AccountClass> {
         classes(&[
             ("checking", AccountClass::Asset),
@@ -759,116 +1067,22 @@ mod tests {
         ])
     }
 
-    fn running_balances(transactions: &[Transaction]) -> HashMap<AccountId, Decimal> {
-        let mut all: HashMap<AccountId, Decimal> = HashMap::new();
-        for t in transactions {
-            for (account, delta) in t.balance_by_account() {
-                *all.entry(account).or_insert(Decimal::ZERO) += delta;
-            }
-        }
-        all
-    }
-
     #[test]
-    fn detect_closes_finds_a_proper_close() {
-        let closing = close(
+    fn closes_returns_close_kind_in_posted_order() {
+        let classes = fy_classes();
+        let first = boundary(
             "2024-12-31",
-            vec![
-                entry("salary", "1000"),
-                entry("expenses/food", "-100"),
-                entry("equity/net", "-900"),
-            ],
-        );
-        let transactions = vec![
-            tx(
-                "",
-                vec![entry("checking", "1000"), entry("salary", "-1000")],
-            ),
-            tx(
-                "",
-                vec![entry("expenses/food", "100"), entry("checking", "-100")],
-            ),
-            closing.clone(),
-        ];
-        let closes = detect_closes(&transactions, &fy_classes());
-        assert_eq!(
-            closes,
-            vec![CloseInfo {
-                id: closing.id,
-                posted_at: ts("2024-12-31")
-            }]
-        );
-
-        let balances = running_balances(&transactions);
-        assert_eq!(
-            balances[&AccountId::parse("salary").unwrap()],
-            Decimal::ZERO
-        );
-        assert_eq!(
-            balances[&AccountId::parse("expenses/food").unwrap()],
-            Decimal::ZERO
-        );
-        let total: Decimal = balances.values().copied().sum();
-        assert_eq!(total, Decimal::ZERO);
-    }
-
-    #[test]
-    fn detect_closes_ignores_open_and_paycheck() {
-        let classes = fy_classes();
-        let transactions = vec![
-            tx(
-                "",
-                vec![entry("checking", "100"), entry("equity/net", "-100")],
-            ),
-            tx("", vec![entry("checking", "200"), entry("salary", "-200")]),
-        ];
-        assert_eq!(detect_closes(&transactions, &classes), vec![]);
-    }
-
-    #[test]
-    fn detect_closes_rejects_partial_zeroing() {
-        // salary is zeroed but expenses/food still carries +100.
-        let classes = fy_classes();
-        let transactions = vec![
-            tx(
-                "",
-                vec![entry("checking", "1000"), entry("salary", "-1000")],
-            ),
-            tx(
-                "",
-                vec![entry("expenses/food", "100"), entry("checking", "-100")],
-            ),
-            tx(
-                "",
-                vec![entry("salary", "1000"), entry("equity/net", "-1000")],
-            ),
-        ];
-        assert_eq!(detect_closes(&transactions, &classes), vec![]);
-    }
-
-    #[test]
-    fn detect_closes_rejects_asset_entries() {
-        let classes = fy_classes();
-        let transactions = vec![
-            tx("", vec![entry("checking", "100"), entry("salary", "-100")]),
-            tx("", vec![entry("salary", "100"), entry("checking", "-100")]),
-        ];
-        assert_eq!(detect_closes(&transactions, &classes), vec![]);
-    }
-
-    #[test]
-    fn detect_closes_finds_consecutive_closes() {
-        let classes = fy_classes();
-        let first = close(
-            "2024-12-31",
+            TransactionKind::Close,
             vec![entry("salary", "1000"), entry("equity/net", "-1000")],
+            &classes,
         );
-        let second = close(
+        let second = boundary(
             "2025-12-31",
+            TransactionKind::Close,
             vec![entry("salary", "500"), entry("equity/net", "-500")],
+            &classes,
         );
-        let first_id = first.id;
-        let second_id = second.id;
+        let (first_id, second_id) = (first.id, second.id);
         let transactions = vec![
             tx(
                 "",
@@ -878,11 +1092,235 @@ mod tests {
             tx("", vec![entry("checking", "500"), entry("salary", "-500")]),
             second,
         ];
-        let closes = detect_closes(&transactions, &classes);
-        assert_eq!(closes.len(), 2);
-        assert_eq!(closes[0].posted_at, ts("2024-12-31"));
-        assert_eq!(closes[1].posted_at, ts("2025-12-31"));
-        assert_eq!(closes[0].id, first_id);
-        assert_eq!(closes[1].id, second_id);
+
+        let found = closes(&transactions);
+        assert_eq!(
+            found,
+            vec![
+                CloseInfo {
+                    id: first_id,
+                    posted_at: ts("2024-12-31")
+                },
+                CloseInfo {
+                    id: second_id,
+                    posted_at: ts("2025-12-31")
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn closes_ignores_normal_and_open_transactions() {
+        let classes = fy_classes();
+        let transactions = vec![
+            boundary(
+                "2024-01-01",
+                TransactionKind::Open,
+                vec![entry("checking", "100"), entry("equity/net", "-100")],
+                &classes,
+            ),
+            tx("", vec![entry("checking", "200"), entry("salary", "-200")]),
+        ];
+        assert_eq!(closes(&transactions), vec![]);
+    }
+
+    /// The reason kinds are recorded rather than inferred. These two
+    /// transactions share a date, so their relative order is decided by
+    /// ULID and is not stable — but the close is still a close either way.
+    #[test]
+    fn a_close_survives_same_day_ordering() {
+        let classes = fy_classes();
+        let closing = boundary(
+            "2024-12-31",
+            TransactionKind::Close,
+            vec![entry("salary", "1000"), entry("equity/net", "-1000")],
+            &classes,
+        );
+        let same_day = dated(
+            "2024-12-31",
+            "late paycheck",
+            vec![entry("checking", "1000"), entry("salary", "-1000")],
+        );
+
+        let close_first = vec![closing.clone(), same_day.clone()];
+        let close_last = vec![same_day, closing];
+        assert_eq!(closes(&close_first).len(), 1);
+        assert_eq!(closes(&close_last).len(), 1);
+        assert_eq!(period_start(&close_first), Some(ts("2024-12-31")));
+        assert_eq!(period_start(&close_last), Some(ts("2024-12-31")));
+    }
+
+    #[test]
+    fn period_start_takes_the_latest_boundary() {
+        let classes = fy_classes();
+        let transactions = vec![
+            boundary(
+                "2024-01-01",
+                TransactionKind::Open,
+                vec![entry("checking", "100"), entry("equity/net", "-100")],
+                &classes,
+            ),
+            tx("", vec![entry("checking", "200"), entry("salary", "-200")]),
+            boundary(
+                "2024-12-31",
+                TransactionKind::Close,
+                vec![entry("salary", "200"), entry("equity/net", "-200")],
+                &classes,
+            ),
+            tx("", vec![entry("checking", "300"), entry("salary", "-300")]),
+        ];
+        assert_eq!(period_start(&transactions), Some(ts("2024-12-31")));
+    }
+
+    /// An open is a boundary too — it is where the first period starts.
+    #[test]
+    fn period_start_counts_an_open_when_nothing_has_closed() {
+        let classes = fy_classes();
+        let transactions = vec![
+            boundary(
+                "2024-01-01",
+                TransactionKind::Open,
+                vec![entry("checking", "100"), entry("equity/net", "-100")],
+                &classes,
+            ),
+            tx("", vec![entry("checking", "200"), entry("salary", "-200")]),
+        ];
+        assert!(closes(&transactions).is_empty());
+        assert_eq!(period_start(&transactions), Some(ts("2024-01-01")));
+    }
+
+    #[test]
+    fn period_start_is_none_without_a_boundary() {
+        let transactions = vec![tx(
+            "",
+            vec![entry("checking", "200"), entry("salary", "-200")],
+        )];
+        assert_eq!(period_start(&transactions), None);
+        assert_eq!(period_start(&[]), None);
+    }
+
+    #[test]
+    fn with_kind_accepts_the_shapes_close_and_open_actually_produce() {
+        let classes = fy_classes();
+        dated(
+            "2024-12-31",
+            "",
+            vec![
+                entry("salary", "1000"),
+                entry("expenses/food", "-400"),
+                entry("equity/net", "-600"),
+            ],
+        )
+        .with_kind(TransactionKind::Close, &classes)
+        .expect("nominal + equity is a close");
+
+        dated(
+            "2024-01-01",
+            "",
+            vec![entry("checking", "100"), entry("equity/net", "-100")],
+        )
+        .with_kind(TransactionKind::Open, &classes)
+        .expect("real + equity is an open");
+    }
+
+    /// A close settles nominal balances into equity; touching an asset
+    /// means it is a transfer, not a close.
+    #[test]
+    fn with_kind_rejects_a_close_that_touches_assets() {
+        let classes = fy_classes();
+        let err = dated(
+            "2024-12-31",
+            "",
+            vec![entry("checking", "100"), entry("salary", "-100")],
+        )
+        .with_kind(TransactionKind::Close, &classes)
+        .expect_err("assets are not allowed in a close");
+        assert!(
+            matches!(
+                err,
+                TransactionError::WrongShape {
+                    kind: TransactionKind::Close,
+                    class: AccountClass::Asset,
+                    ..
+                }
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn with_kind_rejects_an_open_that_touches_nominals() {
+        let classes = fy_classes();
+        let err = dated(
+            "2024-01-01",
+            "",
+            vec![entry("salary", "-100"), entry("checking", "100")],
+        )
+        .with_kind(TransactionKind::Open, &classes)
+        .expect_err("income is not an opening balance");
+        assert!(
+            matches!(
+                err,
+                TransactionError::WrongShape {
+                    kind: TransactionKind::Open,
+                    class: AccountClass::Income,
+                    ..
+                }
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn with_kind_rejects_an_unknown_account() {
+        let err = dated(
+            "2024-12-31",
+            "",
+            vec![entry("salary", "100"), entry("nowhere", "-100")],
+        )
+        .with_kind(TransactionKind::Close, &fy_classes())
+        .expect_err("unregistered account");
+        assert!(matches!(err, TransactionError::UnknownAccount(_)), "{err}");
+    }
+
+    /// Normal is the default and imposes no shape at all.
+    #[test]
+    fn transactions_are_normal_unless_marked() {
+        let plain = tx("", vec![entry("checking", "100"), entry("salary", "-100")]);
+        assert_eq!(plain.kind, TransactionKind::Normal);
+        assert_eq!(TransactionKind::default(), TransactionKind::Normal);
+        assert!(!TransactionKind::Normal.is_boundary());
+        assert!(TransactionKind::Close.is_boundary());
+        assert!(TransactionKind::Open.is_boundary());
+    }
+
+    #[test]
+    fn kind_round_trips_through_its_string_form() {
+        for kind in [
+            TransactionKind::Normal,
+            TransactionKind::Close,
+            TransactionKind::Open,
+        ] {
+            assert_eq!(TransactionKind::parse(kind.as_str()), Ok(kind));
+        }
+        let err = TransactionKind::parse("banana").expect_err("not a kind");
+        assert!(matches!(err, TransactionError::UnknownKind(_)), "{err}");
+    }
+
+    #[test]
+    fn reconstruct_emits_the_kind_so_a_rebuild_keeps_it() {
+        let classes = fy_classes();
+        let closing = boundary(
+            "2024-12-31",
+            TransactionKind::Close,
+            vec![entry("salary", "1000"), entry("equity/net", "-1000")],
+            &classes,
+        );
+        let cmd = closing.render_add_command(&classes).expect("renders");
+        assert!(cmd.contains("--kind close"), "{cmd}");
+
+        let plain = tx("", vec![entry("checking", "100"), entry("salary", "-100")]);
+        let cmd = plain.render_add_command(&classes).expect("renders");
+        assert!(!cmd.contains("--kind"), "normal needs no flag: {cmd}");
     }
 }

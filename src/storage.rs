@@ -11,6 +11,7 @@ use jiff::Timestamp;
 
 use crate::model::{
     Account, AccountClass, AccountId, Entry, Transaction, TransactionError, TransactionId,
+    TransactionKind,
 };
 
 #[derive(Debug, Error)]
@@ -33,6 +34,8 @@ pub enum StorageError {
     UnknownTransaction(String),
     #[error("invalid transaction: {0}")]
     InvalidTransaction(#[from] TransactionError),
+    #[error("invalid transaction kind in db: {0}")]
+    InvalidKind(String),
 }
 
 pub struct Storage {
@@ -61,7 +64,30 @@ impl Storage {
     fn init(conn: Connection) -> Result<Self, StorageError> {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(SCHEMA)?;
+        Self::add_transaction_kind(&conn)?;
         Ok(Self { conn })
+    }
+
+    /// Databases written before transaction kinds existed have no `kind`
+    /// column, and `CREATE TABLE IF NOT EXISTS` will not add one. Every
+    /// existing row becomes `normal`: the old closes are not recoverable
+    /// from the schema, so rebuild with `reconstruct --all` to restore them.
+    fn add_transaction_kind(conn: &Connection) -> Result<(), StorageError> {
+        let mut stmt = conn.prepare("SELECT name FROM pragma_table_info('transactions')")?;
+        let mut has_kind = false;
+        for name in stmt.query_map([], |row| row.get::<_, String>(0))? {
+            if name? == "kind" {
+                has_kind = true;
+            }
+        }
+        drop(stmt);
+        if !has_kind {
+            conn.execute_batch(
+                "ALTER TABLE transactions ADD COLUMN kind TEXT NOT NULL DEFAULT 'normal'
+                 CHECK (kind IN ('normal', 'close', 'open'))",
+            )?;
+        }
+        Ok(())
     }
 
     /// # Errors
@@ -123,8 +149,13 @@ impl Storage {
 
         let tx_conn = self.conn.unchecked_transaction()?;
         tx_conn.execute(
-            "INSERT INTO transactions (id, posted_at, memo) VALUES (?1, ?2, ?3)",
-            params![tx.id.0.to_string(), tx.posted_at.to_string(), tx.memo],
+            "INSERT INTO transactions (id, posted_at, memo, kind) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                tx.id.0.to_string(),
+                tx.posted_at.to_string(),
+                tx.memo,
+                tx.kind.as_str(),
+            ],
         )?;
         for entry in &tx.entries {
             tx_conn.execute(
@@ -167,8 +198,13 @@ impl Storage {
             params![tx.id.0.to_string()],
         )?;
         tx_conn.execute(
-            "INSERT INTO transactions (id, posted_at, memo) VALUES (?1, ?2, ?3)",
-            params![tx.id.0.to_string(), tx.posted_at.to_string(), tx.memo],
+            "INSERT INTO transactions (id, posted_at, memo, kind) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                tx.id.0.to_string(),
+                tx.posted_at.to_string(),
+                tx.memo,
+                tx.kind.as_str(),
+            ],
         )?;
         for entry in &tx.entries {
             tx_conn.execute(
@@ -206,12 +242,12 @@ impl Storage {
     /// stored row fails to parse back into a valid `Transaction`.
     pub fn get_transaction(&self, id: TransactionId) -> Result<Transaction, StorageError> {
         let id_str = id.0.to_string();
-        let (posted_at, memo): (String, String) = self
+        let (posted_at, memo, kind): (String, String, String) = self
             .conn
             .query_row(
-                "SELECT posted_at, memo FROM transactions WHERE id = ?1",
+                "SELECT posted_at, memo, kind FROM transactions WHERE id = ?1",
                 params![id_str],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .map_err(|e| match e {
                 rusqlite::Error::QueryReturnedNoRows => {
@@ -221,6 +257,7 @@ impl Storage {
             })?;
         let posted_at = Timestamp::from_str(&posted_at)
             .map_err(|_| StorageError::InvalidTimestamp(posted_at.clone()))?;
+        let kind = TransactionKind::parse(&kind).map_err(|_| StorageError::InvalidKind(kind))?;
 
         let mut stmt = self.conn.prepare(
             "SELECT account, amount FROM entries WHERE transaction_id = ?1 ORDER BY rowid",
@@ -241,7 +278,7 @@ impl Storage {
             entries.push(Entry { account, amount });
         }
 
-        Ok(Transaction::from_raw(id, posted_at, memo, entries))
+        Ok(Transaction::from_raw(id, posted_at, memo, entries, kind))
     }
 
     /// # Errors
@@ -250,7 +287,7 @@ impl Storage {
     /// stored row fails to parse back into a valid `Transaction`.
     pub fn list_transactions(&self) -> Result<Vec<Transaction>, StorageError> {
         let mut stmt = self.conn.prepare(
-            "SELECT t.id, t.posted_at, t.memo, e.account, e.amount
+            "SELECT t.id, t.posted_at, t.memo, t.kind, e.account, e.amount
              FROM transactions t
              JOIN entries e ON e.transaction_id = t.id
              ORDER BY t.posted_at, t.id, e.rowid",
@@ -263,17 +300,20 @@ impl Storage {
             let id: String = row.get(0)?;
             let posted_at: String = row.get(1)?;
             let memo: String = row.get(2)?;
-            let account: String = row.get(3)?;
-            let amount: String = row.get(4)?;
-            Ok((id, posted_at, memo, account, amount))
+            let kind: String = row.get(3)?;
+            let account: String = row.get(4)?;
+            let amount: String = row.get(5)?;
+            Ok((id, posted_at, memo, kind, account, amount))
         })?;
 
         for row in rows {
-            let (id_str, posted_at_str, memo, account_str, amount_str) = row?;
+            let (id_str, posted_at_str, memo, kind_str, account_str, amount_str) = row?;
             let id = Ulid::from_string(&id_str)
                 .map_err(|_| StorageError::InvalidUlid(id_str.clone()))?;
             let posted_at = Timestamp::from_str(&posted_at_str)
                 .map_err(|_| StorageError::InvalidTimestamp(posted_at_str.clone()))?;
+            let kind = TransactionKind::parse(&kind_str)
+                .map_err(|_| StorageError::InvalidKind(kind_str.clone()))?;
             let account = AccountId::parse(&account_str)
                 .map_err(|_| StorageError::InvalidAccountId(account_str.clone()))?;
             let amount = Decimal::from_str(&amount_str)
@@ -288,7 +328,13 @@ impl Storage {
                     if let Some(t) = current.take() {
                         transactions.push(t);
                     }
-                    current = Some(Transaction::from_raw(id, posted_at, memo, vec![entry]));
+                    current = Some(Transaction::from_raw(
+                        id,
+                        posted_at,
+                        memo,
+                        vec![entry],
+                        kind,
+                    ));
                 }
             }
         }
@@ -353,7 +399,8 @@ CREATE TABLE IF NOT EXISTS accounts (
 CREATE TABLE IF NOT EXISTS transactions (
     id TEXT PRIMARY KEY,
     posted_at TEXT NOT NULL,
-    memo TEXT NOT NULL
+    memo TEXT NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'normal' CHECK (kind IN ('normal', 'close', 'open'))
 );
 
 CREATE TABLE IF NOT EXISTS entries (

@@ -22,7 +22,8 @@ use rust_decimal::Decimal;
 use thiserror::Error;
 
 use crate::model::{
-    Account, AccountClass, AccountId, Entry, Summary, Transaction, TransactionId, detect_closes,
+    Account, AccountClass, AccountId, Activity, Entry, Summary, Transaction, TransactionId,
+    lifetime_activity, period_start,
 };
 use crate::storage::{Storage, StorageError};
 
@@ -72,6 +73,36 @@ fn money_cell(amount: Decimal) -> Cell<'static> {
 enum View {
     Accounts,
     Register { account: AccountId },
+}
+
+/// Which period the summary's activity column covers. A fiscal year here is
+/// "since open, or since the last closing transaction" — which is exactly
+/// what the nominal account balances already hold, since a close zeroes
+/// them. `AllTime` has to be walked out of the transactions instead.
+///
+/// Both boundary kinds start a period, so `model::period_start` treats them
+/// alike; an open just additionally means nothing precedes it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum SummaryPeriod {
+    #[default]
+    FiscalYear,
+    AllTime,
+}
+
+impl SummaryPeriod {
+    fn toggle(self) -> Self {
+        match self {
+            Self::FiscalYear => Self::AllTime,
+            Self::AllTime => Self::FiscalYear,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::FiscalYear => "fiscal year",
+            Self::AllTime => "all time",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,7 +180,9 @@ struct App {
     edit_accounts: Option<EditAccountsState>,
     add_transaction: Option<AddTransactionState>,
     reconstruct_cmd: Option<String>,
-    activity_since: Option<Timestamp>,
+    summary_period: SummaryPeriod,
+    fiscal_year_start: Option<Timestamp>,
+    lifetime: Activity,
 }
 
 impl App {
@@ -169,7 +202,9 @@ impl App {
             edit_accounts: None,
             add_transaction: None,
             reconstruct_cmd: None,
-            activity_since: None,
+            summary_period: SummaryPeriod::default(),
+            fiscal_year_start: None,
+            lifetime: Activity::default(),
         };
         app.load()?;
         app.reset_cursor();
@@ -194,9 +229,8 @@ impl App {
             .iter()
             .map(|(a, _)| (a.id.clone(), a.class))
             .collect();
-        self.activity_since = detect_closes(&transactions, &classes)
-            .last()
-            .map(|close| close.posted_at);
+        self.fiscal_year_start = period_start(&transactions);
+        self.lifetime = lifetime_activity(&transactions, &classes);
 
         self.accounts_with_balances = with_balances;
         self.transactions = transactions;
@@ -212,6 +246,21 @@ impl App {
                 .iter()
                 .map(|(a, balance)| (a.class, *balance)),
         )
+    }
+
+    /// The activity half of the summary, for whichever period is selected.
+    /// The position half never changes: net worth is where you stand now,
+    /// not something you accumulate over a period.
+    fn activity(&self) -> Activity {
+        match self.summary_period {
+            SummaryPeriod::FiscalYear => self.summary().activity,
+            SummaryPeriod::AllTime => self.lifetime,
+        }
+    }
+
+    fn toggle_summary_period(&mut self) {
+        self.summary_period = self.summary_period.toggle();
+        self.status = format!("summary: {}", self.summary_period.label());
     }
 
     fn reload(&mut self) {
@@ -674,6 +723,10 @@ fn handle_normal_key(app: &mut App, key: KeyEvent) -> bool {
             app.reload();
             false
         }
+        KeyCode::Char('s') => {
+            app.toggle_summary_period();
+            false
+        }
         KeyCode::Char('a') => {
             app.start_add();
             false
@@ -984,6 +1037,9 @@ fn group_money(s: &str) -> String {
 }
 
 fn fmt_money(d: Decimal) -> String {
+    // Decimal carries a sign bit, so negating a zero balance would print
+    // "-0.00" in any column that flips its sign for display.
+    let d = if d.is_zero() { Decimal::ZERO } else { d };
     group_money(&format!("{d:.2}"))
 }
 
@@ -1234,10 +1290,14 @@ fn summary_pair(half: usize, label: &str, amount: Decimal, emphasis: bool) -> Ve
 
 fn render_summary(f: &mut ratatui::Frame, app: &App, area: Rect) {
     let summary = app.summary();
-    let period = app.activity_since.map_or_else(
-        || "all time".to_string(),
-        |since| format!("since {}", format_date(since)),
-    );
+    let activity = app.activity();
+    let period = match app.summary_period {
+        SummaryPeriod::AllTime => "all time".to_string(),
+        SummaryPeriod::FiscalYear => app.fiscal_year_start.map_or_else(
+            || SummaryPeriod::FiscalYear.label().to_string(),
+            |start| format!("since {}", format_date(start)),
+        ),
+    };
     let title = if app.search.is_empty() {
         " Summary ".to_string()
     } else {
@@ -1262,17 +1322,17 @@ fn render_summary(f: &mut ratatui::Frame, app: &App, area: Rect) {
     let content = vec![
         row(
             ("assets", summary.assets),
-            ("income", summary.income),
+            ("income", activity.income),
             false,
         ),
         row(
             ("liabilities", summary.liabilities),
-            ("expenses", -summary.expenses),
+            ("expenses", -activity.expenses),
             false,
         ),
         row(
             ("net worth", summary.net_worth()),
-            ("net", summary.net_income()),
+            ("net", activity.net()),
             true,
         ),
     ];
@@ -1625,6 +1685,9 @@ fn render_help_modal(f: &mut ratatui::Frame) {
         row("Enter", "drill into account"),
         row("Esc", "back to accounts"),
         Line::raw(""),
+        header("Summary"),
+        row("s", "toggle fiscal year / all time"),
+        Line::raw(""),
         header("Search & filter"),
         row("/", "substring search"),
         row("f / t", "set from / to date filter"),
@@ -1641,16 +1704,30 @@ fn render_help_modal(f: &mut ratatui::Frame) {
         row("?", "show this help"),
         row("q / Ctrl-C", "quit"),
     ];
+    let title = "Keyboard shortcuts (any key to close)";
+    // Size to the content so no shortcut description gets clipped. Row and
+    // line counts here are tiny; truncation from usize is not a concern.
     #[allow(clippy::cast_possible_truncation)]
-    let height = (content.len() as u16) + 2;
-    let area = centered_rect(48, height, f.area());
+    let (width, height) = {
+        let widest = content
+            .iter()
+            .map(Line::width)
+            .chain(std::iter::once(title.len()))
+            .max()
+            .unwrap_or(0);
+        (
+            (widest as u16).saturating_add(4),
+            (content.len() as u16) + 2,
+        )
+    };
+    let area = centered_rect(width, height, f.area());
     f.render_widget(Clear, area);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(accent())
         .title_style(heading())
-        .title("Keyboard shortcuts (any key to close)");
+        .title(title);
     let paragraph = Paragraph::new(content).block(block);
     f.render_widget(paragraph, area);
 }
@@ -1658,6 +1735,7 @@ fn render_help_modal(f: &mut ratatui::Frame) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::TransactionKind;
     use ratatui::backend::Backend as _;
 
     fn acct_id(s: &str) -> AccountId {
@@ -1719,6 +1797,12 @@ mod tests {
             "-1,234,567.89"
         );
         assert_eq!(group_money("+1234567.89"), "+1,234,567.89");
+    }
+
+    #[test]
+    fn money_formatting_never_prints_negative_zero() {
+        assert_eq!(fmt_money(-Decimal::ZERO), "0.00");
+        assert_eq!(fmt_money(-Decimal::from_str("0.00").unwrap()), "0.00");
     }
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -1921,34 +2005,67 @@ mod tests {
         );
     }
 
+    fn ts(date: &str) -> Timestamp {
+        Date::strptime("%Y-%m-%d", date)
+            .expect("date parses")
+            .at(0, 0, 0, 0)
+            .to_zoned(TimeZone::UTC)
+            .expect("midnight UTC is never ambiguous")
+            .timestamp()
+    }
+
+    fn save_tx(app: &App, date: &str, memo: &str, entries: &[(&str, &str)]) {
+        save_kind(app, date, memo, entries, TransactionKind::Normal);
+    }
+
+    fn save_kind(
+        app: &App,
+        date: &str,
+        memo: &str,
+        entries: &[(&str, &str)],
+        kind: TransactionKind,
+    ) {
+        let entries = entries
+            .iter()
+            .map(|(account, amount)| Entry {
+                account: acct_id(account),
+                amount: Decimal::from_str(amount).expect("amount parses"),
+            })
+            .collect();
+        let tx = Transaction::new(TransactionId::new(), ts(date), memo.to_string(), entries)
+            .expect("tx balances");
+        let classes = app
+            .storage
+            .list_accounts()
+            .expect("accounts")
+            .into_iter()
+            .map(|a| (a.id, a.class))
+            .collect();
+        let tx = tx
+            .with_kind(kind, &classes)
+            .expect("kind matches the shape");
+        app.storage.save_transaction(&tx).expect("saved");
+    }
+
+    const OPENED_ON: &str = "2025-03-01";
+    const CLOSED_ON: &str = "2025-12-31";
+
     /// `seeded_app` plus a paycheck and a bill, so the summary has
     /// something to add up: assets 1,234.56, income 2,000, expenses 765.44.
     fn app_with_activity() -> App {
-        let app = seeded_app();
-        for (memo, entries) in [
-            ("Dues", vec![("income/dues", "-2000"), ("general", "2000")]),
-            (
-                "City",
-                vec![("general", "-765.44"), ("expense/city", "765.44")],
-            ),
-        ] {
-            let entries = entries
-                .into_iter()
-                .map(|(account, amount)| Entry {
-                    account: acct_id(account),
-                    amount: Decimal::from_str(amount).expect("amount parses"),
-                })
-                .collect();
-            let tx = Transaction::new(
-                TransactionId::new(),
-                today_timestamp(),
-                memo.to_string(),
-                entries,
-            )
-            .expect("tx balances");
-            app.storage.save_transaction(&tx).expect("saved");
-        }
-        let mut app = app;
+        let mut app = seeded_app();
+        save_tx(
+            &app,
+            OPENED_ON,
+            "Dues",
+            &[("income/dues", "-2000"), ("general", "2000")],
+        );
+        save_tx(
+            &app,
+            "2025-04-01",
+            "City",
+            &[("general", "-765.44"), ("expense/city", "765.44")],
+        );
         app.load().expect("reloads");
         app
     }
@@ -1965,10 +2082,16 @@ mod tests {
         let app = app_with_activity();
         let summary = app.summary();
         assert_eq!(summary.assets, Decimal::from_str("1234.56").unwrap());
-        assert_eq!(summary.income, Decimal::from(2000));
-        assert_eq!(summary.expenses, Decimal::from_str("765.44").unwrap());
+        assert_eq!(summary.activity.income, Decimal::from(2000));
+        assert_eq!(
+            summary.activity.expenses,
+            Decimal::from_str("765.44").unwrap()
+        );
         assert_eq!(summary.net_worth(), Decimal::from_str("1234.56").unwrap());
-        assert_eq!(summary.net_income(), Decimal::from_str("1234.56").unwrap());
+        assert_eq!(
+            summary.activity.net(),
+            Decimal::from_str("1234.56").unwrap()
+        );
     }
 
     #[test]
@@ -1990,13 +2113,67 @@ mod tests {
         }
     }
 
-    /// With no close in the history the nominal balances are all-time.
+    /// A fiscal year runs from the open, or from the last close. With
+    /// neither, it runs over everything and has no date to show.
     #[test]
-    fn render_summary_labels_the_activity_period() {
+    fn render_summary_labels_a_fiscal_year_with_no_boundary() {
         let mut app = app_with_activity();
-        assert!(app.activity_since.is_none());
+        assert_eq!(app.summary_period, SummaryPeriod::FiscalYear, "default");
+        assert_eq!(app.fiscal_year_start, None, "nothing has opened or closed");
         let text = render_at(&mut app, 80, 24);
-        assert!(text.contains("activity all time"), "period missing: {text}");
+        assert!(
+            text.contains("activity fiscal year"),
+            "period missing: {text}"
+        );
+    }
+
+    /// An open dates the first fiscal year exactly, with no close needed.
+    #[test]
+    fn render_summary_dates_the_first_fiscal_year_from_an_open() {
+        let mut app = seeded_app();
+        app.storage
+            .register_account(&Account {
+                id: acct_id("equity/net"),
+                class: AccountClass::Equity,
+            })
+            .expect("registered");
+        save_kind(
+            &app,
+            OPENED_ON,
+            "Opening balances",
+            &[("general", "5000"), ("equity/net", "-5000")],
+            TransactionKind::Open,
+        );
+        save_tx(
+            &app,
+            "2025-04-01",
+            "Dues",
+            &[("income/dues", "-2000"), ("general", "2000")],
+        );
+        app.load().expect("reloads");
+
+        assert_eq!(
+            app.fiscal_year_start.map(format_date),
+            Some(OPENED_ON.to_string())
+        );
+        let text = render_at(&mut app, 80, 24);
+        assert!(
+            text.contains(&format!("activity since {OPENED_ON}")),
+            "period missing: {text}"
+        );
+        assert!(text.contains("2,000.00"), "the open is not income: {text}");
+    }
+
+    /// An empty book has no open to date the fiscal year from.
+    #[test]
+    fn render_summary_labels_a_bare_fiscal_year_when_the_book_is_empty() {
+        let mut app = seeded_app();
+        assert!(app.fiscal_year_start.is_none());
+        let text = render_at(&mut app, 80, 24);
+        assert!(
+            text.contains("activity fiscal year"),
+            "period missing: {text}"
+        );
     }
 
     /// Net worth over a filtered subset is not a meaningful number, so the
@@ -2042,8 +2219,8 @@ mod tests {
         render_at(&mut app, 4, 24);
     }
 
-    /// Once a close is on the books the nominal balances only cover the
-    /// period since it, and the panel dates them accordingly.
+    /// A close zeroes the nominal accounts without moving net worth, and
+    /// the fiscal year re-dates itself from the close.
     #[test]
     fn render_summary_dates_activity_from_the_last_close() {
         let mut app = app_with_activity();
@@ -2053,32 +2230,26 @@ mod tests {
                 class: AccountClass::Equity,
             })
             .expect("registered");
-        let close = Transaction::new(
-            TransactionId::new(),
-            today_timestamp(),
-            "FY close".to_string(),
-            vec![
-                Entry {
-                    account: acct_id("income/dues"),
-                    amount: Decimal::from(2000),
-                },
-                Entry {
-                    account: acct_id("expense/city"),
-                    amount: Decimal::from_str("-765.44").unwrap(),
-                },
-                Entry {
-                    account: acct_id("equity/net"),
-                    amount: Decimal::from_str("-1234.56").unwrap(),
-                },
+        save_kind(
+            &app,
+            CLOSED_ON,
+            "FY close",
+            &[
+                ("income/dues", "2000"),
+                ("expense/city", "-765.44"),
+                ("equity/net", "-1234.56"),
             ],
-        )
-        .expect("tx balances");
-        app.storage.save_transaction(&close).expect("saved");
+            TransactionKind::Close,
+        );
         app.load().expect("reloads");
 
-        assert!(app.activity_since.is_some(), "close not detected");
+        assert_eq!(
+            app.fiscal_year_start.map(format_date),
+            Some(CLOSED_ON.to_string()),
+            "close not recorded"
+        );
         let summary = app.summary();
-        assert_eq!(summary.net_income(), Decimal::ZERO, "nominals not zeroed");
+        assert_eq!(summary.activity.net(), Decimal::ZERO, "nominals not zeroed");
         assert_eq!(
             summary.net_worth(),
             Decimal::from_str("1234.56").unwrap(),
@@ -2087,10 +2258,7 @@ mod tests {
 
         let text = render_at(&mut app, 80, 24);
         assert!(
-            text.contains(&format!(
-                "activity since {}",
-                format_date(today_timestamp())
-            )),
+            text.contains(&format!("activity since {CLOSED_ON}")),
             "close date missing: {text}"
         );
     }
@@ -2129,6 +2297,124 @@ mod tests {
         let mut app = app_with_activity();
         app.table_state.select(Some(2));
         assert_eq!(balance_fg(&mut app, 4), NEGATIVE);
+    }
+
+    /// `app_with_activity` plus a close, so the two periods diverge: the
+    /// fiscal year holds only the dues posted after the close, while all
+    /// time still counts the year the close retired.
+    fn app_with_a_closed_year() -> App {
+        let mut app = app_with_activity();
+        app.storage
+            .register_account(&Account {
+                id: acct_id("equity/net"),
+                class: AccountClass::Equity,
+            })
+            .expect("registered");
+        save_kind(
+            &app,
+            CLOSED_ON,
+            "FY close",
+            &[
+                ("income/dues", "2000"),
+                ("expense/city", "-765.44"),
+                ("equity/net", "-1234.56"),
+            ],
+            TransactionKind::Close,
+        );
+        save_tx(
+            &app,
+            "2026-01-15",
+            "Dues",
+            &[("income/dues", "-500"), ("general", "500")],
+        );
+        app.load().expect("reloads");
+        app
+    }
+
+    #[test]
+    fn summary_period_defaults_to_fiscal_year() {
+        let app = app_with_a_closed_year();
+        assert_eq!(app.summary_period, SummaryPeriod::FiscalYear);
+        assert_eq!(
+            app.activity().income,
+            Decimal::from(500),
+            "fiscal year is the period since the close"
+        );
+    }
+
+    #[test]
+    fn s_toggles_the_summary_period() {
+        let mut app = app_with_a_closed_year();
+
+        handle_key(&mut app, key(KeyCode::Char('s')));
+        assert_eq!(app.summary_period, SummaryPeriod::AllTime);
+        assert_eq!(app.status, "summary: all time");
+        assert_eq!(
+            app.activity().income,
+            Decimal::from(2500),
+            "all time counts through the close"
+        );
+        assert_eq!(
+            app.activity().expenses,
+            Decimal::from_str("765.44").unwrap()
+        );
+
+        handle_key(&mut app, key(KeyCode::Char('s')));
+        assert_eq!(app.summary_period, SummaryPeriod::FiscalYear);
+        assert_eq!(app.status, "summary: fiscal year");
+        assert_eq!(app.activity().income, Decimal::from(500));
+    }
+
+    /// Net worth is a position, not a flow — the left column must not move.
+    #[test]
+    fn toggling_the_period_leaves_net_worth_alone() {
+        let mut app = app_with_a_closed_year();
+        let before = app.summary().net_worth();
+        handle_key(&mut app, key(KeyCode::Char('s')));
+        assert_eq!(app.summary().net_worth(), before);
+        assert_eq!(before, Decimal::from_str("1734.56").unwrap());
+    }
+
+    #[test]
+    fn render_summary_reflects_the_toggled_period() {
+        let mut app = app_with_a_closed_year();
+        let text = render_at(&mut app, 80, 24);
+        assert!(
+            text.contains(&format!("activity since {CLOSED_ON}")),
+            "fiscal year should be dated from the close: {text}"
+        );
+        assert!(
+            text.contains("500.00"),
+            "fiscal year income missing: {text}"
+        );
+
+        handle_key(&mut app, key(KeyCode::Char('s')));
+        let text = render_at(&mut app, 80, 24);
+        assert!(text.contains("activity all time"), "label missing: {text}");
+        assert!(text.contains("2,500.00"), "lifetime income missing: {text}");
+        assert!(text.contains("1,734.56"), "net worth moved: {text}");
+    }
+
+    /// The toggle is a view, not an edit, so it stays lowercase and the
+    /// period survives a reload from disk.
+    #[test]
+    fn summary_period_survives_a_reload() {
+        let mut app = app_with_a_closed_year();
+        handle_key(&mut app, key(KeyCode::Char('s')));
+        handle_key(&mut app, key(KeyCode::Char('r')));
+        assert_eq!(app.summary_period, SummaryPeriod::AllTime);
+        assert_eq!(app.activity().income, Decimal::from(2500));
+    }
+
+    #[test]
+    fn help_lists_the_summary_toggle() {
+        let mut app = seeded_app();
+        handle_key(&mut app, key(KeyCode::Char('?')));
+        let text = render_at(&mut app, 80, 24);
+        assert!(
+            text.contains("toggle fiscal year / all time"),
+            "shortcut undocumented: {text}"
+        );
     }
 
     #[test]

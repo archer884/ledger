@@ -11,7 +11,7 @@ use ulid::Ulid;
 
 use crate::model::{
     Account, AccountClass, AccountId, AccountIdError, CloseInfo, Entry, ReconstructError,
-    Transaction, TransactionError, TransactionId, detect_closes,
+    Transaction, TransactionError, TransactionId, TransactionKind, closes,
 };
 use crate::storage::{Storage, StorageError};
 use crate::tui::TuiError;
@@ -71,6 +71,29 @@ pub struct AddArgs {
     /// Entry in the form ID[:CLASS]:AMOUNT (e.g. checking:asset:1000)
     #[arg(long = "entry", value_name = "ID[:CLASS]:AMOUNT")]
     pub entries: Vec<String>,
+
+    /// Role this transaction plays in the book. Emitted by `reconstruct` so
+    /// a rebuilt ledger keeps its period boundaries; you rarely pass it by
+    /// hand, since `close` and `open` set it for you.
+    #[arg(long, value_enum, default_value_t = TransactionKindArg::Normal)]
+    pub kind: TransactionKindArg,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum TransactionKindArg {
+    Normal,
+    Close,
+    Open,
+}
+
+impl From<TransactionKindArg> for TransactionKind {
+    fn from(value: TransactionKindArg) -> Self {
+        match value {
+            TransactionKindArg::Normal => Self::Normal,
+            TransactionKindArg::Close => Self::Close,
+            TransactionKindArg::Open => Self::Open,
+        }
+    }
 }
 
 #[derive(Args)]
@@ -279,6 +302,7 @@ fn run_add(args: &AddArgs, storage: &Storage) -> Result<(), CliError> {
         args.date.as_deref(),
         args.memo.as_deref(),
         &args.entries,
+        args.kind.into(),
         storage,
     )
 }
@@ -293,6 +317,7 @@ fn run_income(args: &IncomeArgs, storage: &Storage) -> Result<(), CliError> {
         args.date.as_deref(),
         args.memo.as_deref(),
         &entries,
+        TransactionKind::Normal,
         storage,
     )
 }
@@ -335,6 +360,7 @@ fn run_close(args: &CloseArgs, storage: &Storage) -> Result<(), CliError> {
         args.date.as_deref(),
         args.memo.as_deref(),
         &entries,
+        TransactionKind::Close,
         storage,
     )?;
 
@@ -365,6 +391,7 @@ fn run_open(args: &OpenArgs, storage: &Storage) -> Result<(), CliError> {
         args.date.as_deref(),
         args.memo.as_deref(),
         &entries,
+        TransactionKind::Open,
         storage,
     )?;
     println!("recorded opening balances; equity/net plugged by {plug}");
@@ -405,6 +432,7 @@ fn execute_transaction(
     date: Option<&str>,
     memo: Option<&str>,
     entry_strs: &[String],
+    kind: TransactionKind,
     storage: &Storage,
 ) -> Result<(), CliError> {
     let posted_at = resolve_date(date)?;
@@ -426,6 +454,11 @@ fn execute_transaction(
     }
 
     let tx = Transaction::new(TransactionId::new(), posted_at, memo, entries)?;
+    let tx = if kind == TransactionKind::Normal {
+        tx
+    } else {
+        tx.with_kind(kind, &account_classes(storage)?)?
+    };
 
     storage.save_transaction(&tx)?;
 
@@ -460,8 +493,7 @@ fn run_audit(args: &AuditArgs, storage: &Storage) -> Result<(), CliError> {
     let transactions = storage.list_transactions()?;
     let (from, to) = match &args.fy {
         Some(fy) => {
-            let classes = account_classes(storage)?;
-            let closes = detect_closes(&transactions, &classes);
+            let closes = closes(&transactions);
             resolve_fy_period(&transactions, &closes, fy)?
         }
         None => (
@@ -1251,8 +1283,126 @@ mod tests {
         assert_eq!(balances[&acct("equity/net")], Decimal::from(-1500));
 
         let transactions = storage.list_transactions().expect("list");
+        let found = closes(&transactions);
+        assert_eq!(found.len(), 1, "close should be marked, not inferred");
+        let closing = transactions
+            .iter()
+            .find(|t| t.id == found[0].id)
+            .expect("close is in the list");
+        assert_eq!(closing.kind, TransactionKind::Close);
+        assert_eq!(closing.memo, "FY2025");
+    }
+
+    /// `open` marks its transaction too, so "since open" is exact rather
+    /// than a guess at whichever transaction happens to sort first.
+    #[test]
+    fn open_marks_its_transaction_as_a_boundary() {
+        let storage = Storage::in_memory().expect("in-memory db");
+        let args = OpenArgs {
+            date: Some("2025-01-01".to_string()),
+            memo: None,
+            entries: vec!["checking:asset:1000".to_string()],
+        };
+        run_open(&args, &storage).expect("open works");
+
+        let transactions = storage.list_transactions().expect("list");
+        assert_eq!(transactions.len(), 1);
+        assert_eq!(transactions[0].kind, TransactionKind::Open);
+        assert!(
+            closes(&transactions).is_empty(),
+            "an open is not a close, even though both start a period"
+        );
+        assert_eq!(
+            crate::model::period_start(&transactions),
+            Some(transactions[0].posted_at)
+        );
+    }
+
+    /// The round trip that makes recorded kinds safe: `reconstruct --all`
+    /// emits `--kind`, and replaying it restores the boundary.
+    #[test]
+    fn reconstruct_round_trips_a_close_through_add() {
+        let storage = Storage::in_memory().expect("in-memory db");
+        for (id, class) in [
+            ("checking", AccountClass::Asset),
+            ("salary", AccountClass::Income),
+            ("equity/net", AccountClass::Equity),
+        ] {
+            storage
+                .register_account(&Account {
+                    id: AccountId::parse(id).expect("account parses"),
+                    class,
+                })
+                .expect("registered");
+        }
+        storage
+            .save_transaction(&tx(
+                "2025-06-01",
+                vec![entry("checking", 2000), entry("salary", -2000)],
+            ))
+            .expect("saved");
+        run_close(
+            &CloseArgs {
+                date: Some("2025-12-31".to_string()),
+                memo: None,
+            },
+            &storage,
+        )
+        .expect("close works");
+
+        let original = storage.list_transactions().expect("list");
         let classes = account_classes(&storage).expect("classes");
-        assert_eq!(detect_closes(&transactions, &classes).len(), 1);
+        let script = crate::model::render_all_add_commands(&original, &classes).expect("renders");
+        assert!(script.contains("--kind close"), "{script}");
+
+        // Replay the emitted commands into a fresh book.
+        let rebuilt = Storage::in_memory().expect("in-memory db");
+        for (id, class) in [
+            ("checking", AccountClass::Asset),
+            ("salary", AccountClass::Income),
+            ("equity/net", AccountClass::Equity),
+        ] {
+            rebuilt
+                .register_account(&Account {
+                    id: AccountId::parse(id).expect("account parses"),
+                    class,
+                })
+                .expect("registered");
+        }
+        for source in &original {
+            let kind = match source.kind {
+                TransactionKind::Normal => TransactionKindArg::Normal,
+                TransactionKind::Close => TransactionKindArg::Close,
+                TransactionKind::Open => TransactionKindArg::Open,
+            };
+            let entries: Vec<String> = source
+                .entries
+                .iter()
+                .map(|e| format!("{}:{}", e.account, e.amount))
+                .collect();
+            run_add(
+                &AddArgs {
+                    date: Some(source.posted_at.to_zoned(TimeZone::UTC).date().to_string()),
+                    memo: None,
+                    entries,
+                    kind,
+                },
+                &rebuilt,
+            )
+            .expect("replayed");
+        }
+
+        let replayed = rebuilt.list_transactions().expect("list");
+        assert_eq!(replayed.len(), original.len());
+        assert_eq!(
+            closes(&replayed).len(),
+            1,
+            "the close must survive the rebuild"
+        );
+        assert_eq!(
+            rebuilt.balances().expect("balances"),
+            storage.balances().expect("balances")
+        );
     }
 
     #[test]

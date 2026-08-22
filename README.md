@@ -42,6 +42,12 @@ cargo run -- tui     # explicit
 
 Two entries minimum per transaction, and the amounts must sum to zero. The model layer rejects anything else at write time.
 
+### Transaction kinds
+
+Every transaction has a kind: `normal` (the default), `close`, or `open`. It is recorded on the transaction, not guessed from the entries later, which is what lets `audit --fy` and the TUI summary find your fiscal-year boundaries reliably.
+
+`ledger close` and `ledger open` set the kind for you — you should not normally need to pass it. `ledger add --kind close|open` exists mainly so `reconstruct --all` can round-trip, and it is checked against the entries: a `close` may only touch income, expense, and equity accounts; an `open` may only touch asset, liability, and equity accounts. Anything else is rejected, so a kind can never claim something the entries don't support.
+
 ### Flags
 
 - `--db <path>` / `LEDGER_DB=<path>` — use a specific database file (overrides everything)
@@ -66,7 +72,11 @@ The accounts view keeps a summary panel pinned to the bottom:
 ╰──────────────────────────────────────────────────────────────────╯
 ```
 
-The left column is your position and the right column is the period's activity; each column adds up on its own. "Activity" covers everything since the last `ledger close` — income and expense accounts are zeroed by a close, so the panel says `since YYYY-MM-DD` once you have closed a year, and `all time` until then.
+The left column is your position and the right column is the period's activity; each column adds up on its own.
+
+Press `s` to toggle the activity column between **fiscal year** (the default) and **all time**. A fiscal year here means "since you opened the book, or since the last closing transaction", so the panel dates it for you: `activity since 2025-12-31`. All time counts straight through your closes, back to the beginning.
+
+Only the right column moves when you toggle. Net worth is where you stand right now, not something that accumulates over a period, so it reads the same in both modes.
 
 The panel always totals every account, even while a search filter is active (it says "all accounts" when it is), because a net worth computed over some arbitrary subset of accounts isn't a number that means anything. It hides itself on a short terminal so the account list keeps its rows.
 
@@ -74,7 +84,7 @@ The panel always totals every account, even while a search filter is active (it 
 
 For a single transaction, the TUI's `y` key copies the `ledger add` command that would recreate the selected row to your clipboard. On the CLI, `ledger reconstruct <TX_ID>` prints the same thing to stdout.
 
-For the whole database, `ledger reconstruct --all` writes a series of `ledger add` commands in posted order, separated by blank lines. The output is a portable shell script — paste it into a file, edit what you need to fix, and replay it. This is the cleanest way to rewrite history when a transaction was entered with wrong values, since the alternative is to post a correction that confuses later reports.
+For the whole database, `ledger reconstruct --all` writes a series of `ledger add` commands in posted order, separated by blank lines. Closing and opening transactions carry a `--kind` flag so a rebuilt ledger keeps its fiscal-year boundaries. The output is a portable shell script — paste it into a file, edit what you need to fix, and replay it. This is the cleanest way to rewrite history when a transaction was entered with wrong values, since the alternative is to post a correction that confuses later reports.
 
 ```bash
 # 1. Dump the current database to a script
@@ -234,3 +244,16 @@ Domain types live in `model.rs` and are storage-agnostic. The storage layer in `
 - Import from CSV / OFX / bank statements
 - Reports beyond "balance per account" (no P&L, no balance sheet, no cash flow)
 - Multi-user, multi-device sync (single-user, single-system by design)
+
+## Upgrading a ledger created before transaction kinds
+
+Databases written before kinds existed get the new column automatically on first open, with every row set to `normal`. Old closes are not recoverable from the schema — nothing in the file records which transaction was a close — so `audit --fy` and the summary's fiscal-year view will see no boundaries until you rebuild:
+
+```bash
+ledger reconstruct --all > rebuild.sh   # edit: add "--kind close" / "--kind open"
+                                        # to the closing and opening transactions
+mv ~/Library/Application\ Support/ledger/ledger.db ledger.db.bak
+bash rebuild.sh
+```
+
+The edit is one flag per boundary transaction, and there are usually only a handful. Keep the backup until you have confirmed the balances match.
