@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::fmt::Write as _;
 use std::io::{self, Stdout};
 use std::str::FromStr;
 
@@ -13,7 +12,7 @@ use jiff::civil::Date;
 use jiff::tz::TimeZone;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
@@ -468,40 +467,48 @@ impl App {
         self.reset_cursor();
     }
 
-    fn status_line(&self) -> String {
+    fn status_line(&self) -> Line<'static> {
+        let dim = Style::default().add_modifier(Modifier::DIM);
         match self.input_mode {
             InputMode::Normal => {
-                let mut s = String::new();
+                let mut spans: Vec<Span<'static>> = Vec::new();
                 if !self.search.is_empty() {
-                    let _ = write!(s, "/{} ", self.search);
+                    spans.push(Span::raw(format!("/{} ", self.search)));
                 }
                 if let Some(from) = self.date_from {
-                    let _ = write!(s, "from:{} ", format_date(from));
+                    spans.push(Span::raw(format!("from:{} ", format_date(from))));
                 }
                 if let Some(to) = self.date_to {
-                    let _ = write!(s, "to:{} ", format_date(to));
+                    spans.push(Span::raw(format!("to:{} ", format_date(to))));
                 }
                 if !self.status.is_empty() {
-                    let _ = write!(s, "[{}] ", self.status);
+                    spans.push(Span::raw(format!("[{}] ", self.status)));
                 }
-                s.push_str("?: help  q: quit");
-                s
+                spans.push(Span::styled("?: help  q: quit", dim));
+                Line::from(spans)
             }
-            InputMode::Search => format!("/{}  (Enter: confirm, Esc: cancel)", self.input_buffer),
-            InputMode::DateFrom => format!(
+            InputMode::Search => Line::raw(format!(
+                "/{}  (Enter: confirm, Esc: cancel)",
+                self.input_buffer
+            )),
+            InputMode::DateFrom => Line::raw(format!(
                 "from (YYYY-MM-DD, empty to clear): {}  (Enter: confirm, Esc: cancel)",
                 self.input_buffer
-            ),
-            InputMode::DateTo => format!(
+            )),
+            InputMode::DateTo => Line::raw(format!(
                 "to (YYYY-MM-DD, empty to clear): {}  (Enter: confirm, Esc: cancel)",
                 self.input_buffer
+            )),
+            InputMode::DeleteConfirm => Line::raw("Delete this transaction? (y/n)"),
+            InputMode::EditAccounts => Line::raw(
+                "C: edit accounts  j/k: select entry  type to edit account  Enter: confirm  Esc: cancel",
             ),
-            InputMode::DeleteConfirm => "Delete this transaction? (y/n)".to_string(),
-            InputMode::EditAccounts => "C: edit accounts  j/k: select entry  type to edit account  Enter: confirm  Esc: cancel".to_string(),
-            InputMode::EditAccountsConfirm => "Apply account changes? (y/n)".to_string(),
-            InputMode::AddTransaction => "a: add  Tab: next field  j/k: pick account  Enter: preview  Esc: cancel".to_string(),
-            InputMode::AddConfirm => "Save this transaction? (y/n)".to_string(),
-            InputMode::Reconstruct | InputMode::Help => "any key to close".to_string(),
+            InputMode::EditAccountsConfirm => Line::raw("Apply account changes? (y/n)"),
+            InputMode::AddTransaction => {
+                Line::raw("a: add  Tab: next field  j/k: pick account  Enter: preview  Esc: cancel")
+            }
+            InputMode::AddConfirm => Line::raw("Save this transaction? (y/n)"),
+            InputMode::Reconstruct | InputMode::Help => Line::raw("any key to close"),
         }
     }
 }
@@ -891,6 +898,35 @@ fn format_date(t: Timestamp) -> String {
     t.to_zoned(TimeZone::UTC).date().to_string()
 }
 
+/// Insert thousands separators into the integer part of an already
+/// formatted decimal string, preserving any leading sign.
+fn group_money(s: &str) -> String {
+    let (int_part, rest) = match s.split_once('.') {
+        Some((i, r)) => (i, format!(".{r}")),
+        None => (s, String::new()),
+    };
+    let (sign, digits) = if let Some(d) = int_part.strip_prefix('-') {
+        ("-", d)
+    } else if let Some(d) = int_part.strip_prefix('+') {
+        ("+", d)
+    } else {
+        ("", int_part)
+    };
+    let mut grouped = String::with_capacity(s.len() + digits.len() / 3);
+    let n = digits.len();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (n - i) % 3 == 0 {
+            grouped.push(',');
+        }
+        grouped.push(c);
+    }
+    format!("{sign}{grouped}{rest}")
+}
+
+fn fmt_money(d: Decimal) -> String {
+    group_money(&format!("{d:.2}"))
+}
+
 fn parse_date_input(s: &str) -> Option<Timestamp> {
     let trimmed = s.trim();
     if trimmed.is_empty() {
@@ -972,67 +1008,44 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
         chunks[0],
     );
 
-    let table = match &app.view {
+    let empty_msg: Option<String> = match &app.view {
         View::Accounts => {
-            let header = Row::new(vec![
-                Cell::from("account"),
-                Cell::from(Text::from("balance").right_aligned()),
-            ])
-            .style(Style::default().add_modifier(Modifier::BOLD));
-            let rows: Vec<Row> = app
-                .filtered_accounts()
-                .iter()
-                .map(|(a, b)| {
-                    Row::new(vec![
-                        Cell::from(a.id.to_string()),
-                        Cell::from(Text::from(format!("{b:.2}")).right_aligned()),
-                    ])
+            if app.filtered_accounts().is_empty() {
+                Some(if app.accounts_with_balances.is_empty() {
+                    "no accounts yet — register one with `ledger add`".to_string()
+                } else {
+                    "no accounts match the current filters".to_string()
                 })
-                .collect();
-            Table::new(rows, [Constraint::Length(32), Constraint::Length(14)])
-                .header(header)
-                .column_spacing(2)
-                .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
-                .highlight_symbol("> ")
+            } else {
+                None
+            }
         }
         View::Register { account } => {
-            let header = Row::new(vec![
-                Cell::from("date"),
-                Cell::from("memo"),
-                Cell::from(Text::from("amount").right_aligned()),
-            ])
-            .style(Style::default().add_modifier(Modifier::BOLD));
-            let rows: Vec<Row> = app
-                .filtered_transactions()
-                .iter()
-                .map(|tx| {
-                    let amount = tx
-                        .entries
-                        .iter()
-                        .find(|e| &e.account == account)
-                        .map_or(Decimal::ZERO, |e| e.amount);
-                    Row::new(vec![
-                        Cell::from(format_date(tx.posted_at)),
-                        Cell::from(tx.memo.clone()),
-                        Cell::from(Text::from(format!("{amount:.2}")).right_aligned()),
-                    ])
+            if app.filtered_transactions().is_empty() {
+                let has_any = app
+                    .transactions
+                    .iter()
+                    .any(|t| t.entries.iter().any(|e| &e.account == account));
+                Some(if has_any {
+                    "no transactions match the current filters".to_string()
+                } else {
+                    "no transactions yet for this account".to_string()
                 })
-                .collect();
-            Table::new(
-                rows,
-                [
-                    Constraint::Length(12),
-                    Constraint::Min(20),
-                    Constraint::Length(14),
-                ],
-            )
-            .header(header)
-            .column_spacing(2)
-            .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
-            .highlight_symbol("> ")
+            } else {
+                None
+            }
         }
     };
-    f.render_stateful_widget(table, chunks[1], &mut app.table_state);
+
+    if let Some(msg) = empty_msg {
+        render_empty_state(f, chunks[1], &msg);
+    } else {
+        let table = match &app.view {
+            View::Accounts => accounts_table(app),
+            View::Register { account } => register_table(app, account),
+        };
+        f.render_stateful_widget(table, chunks[1], &mut app.table_state);
+    }
 
     let status = app.status_line();
     f.render_widget(Paragraph::new(status), chunks[2]);
@@ -1055,6 +1068,82 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
         }
         _ => {}
     }
+}
+
+fn accounts_table(app: &App) -> Table<'static> {
+    let header = Row::new(vec![
+        Cell::from("account"),
+        Cell::from(Text::from("balance").right_aligned()),
+    ])
+    .style(Style::default().add_modifier(Modifier::BOLD));
+    let rows: Vec<Row> = app
+        .filtered_accounts()
+        .iter()
+        .map(|(a, b)| {
+            Row::new(vec![
+                Cell::from(a.id.to_string()),
+                Cell::from(Text::from(fmt_money(*b)).right_aligned()),
+            ])
+        })
+        .collect();
+    Table::new(rows, [Constraint::Length(32), Constraint::Length(14)])
+        .header(header)
+        .column_spacing(2)
+        .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+        .highlight_symbol("> ")
+}
+
+fn register_table(app: &App, account: &AccountId) -> Table<'static> {
+    let header = Row::new(vec![
+        Cell::from("date"),
+        Cell::from("memo"),
+        Cell::from(Text::from("amount").right_aligned()),
+    ])
+    .style(Style::default().add_modifier(Modifier::BOLD));
+    let rows: Vec<Row> = app
+        .filtered_transactions()
+        .iter()
+        .map(|tx| {
+            let amount = tx
+                .entries
+                .iter()
+                .find(|e| &e.account == account)
+                .map_or(Decimal::ZERO, |e| e.amount);
+            Row::new(vec![
+                Cell::from(format_date(tx.posted_at)),
+                Cell::from(tx.memo.clone()),
+                Cell::from(Text::from(fmt_money(amount)).right_aligned()),
+            ])
+        })
+        .collect();
+    Table::new(
+        rows,
+        [
+            Constraint::Length(12),
+            Constraint::Min(20),
+            Constraint::Length(14),
+        ],
+    )
+    .header(header)
+    .column_spacing(2)
+    .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+    .highlight_symbol("> ")
+}
+
+fn render_empty_state(f: &mut ratatui::Frame, area: Rect, msg: &str) {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(0),
+            Constraint::Length(1),
+            Constraint::Min(0),
+        ])
+        .split(area);
+    let text = Line::raw(msg.to_string()).style(Style::default().add_modifier(Modifier::DIM));
+    f.render_widget(
+        Paragraph::new(text).alignment(Alignment::Center),
+        vertical[1],
+    );
 }
 
 fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
@@ -1166,15 +1255,24 @@ fn render_add_confirm_modal(f: &mut ratatui::Frame, app: &App, state: &AddTransa
             .to_lowercase();
         content.push(Line::from(vec![
             Span::raw(format!("  {:<24}", entry.account.to_string())),
-            Span::raw(format!("{:>12}{class}", format!("{:+.2}", entry.amount))),
+            Span::raw(format!(
+                "{:>12}{class}",
+                group_money(&format!("{:+.2}", entry.amount))
+            )),
         ]));
     }
     if !state.memo.is_empty() {
         content.push(Line::raw(format!("  memo: {}", state.memo)));
     }
     content.push(Line::raw(""));
-    content.push(Line::raw("  Posts today").style(Style::default().add_modifier(Modifier::DIM)));
-    let area = centered_rect(48, 8, f.area());
+    content.push(
+        Line::raw(format!(
+            "  Posts today ({})",
+            format_date(today_timestamp())
+        ))
+        .style(Style::default().add_modifier(Modifier::DIM)),
+    );
+    let area = centered_rect(58, 8, f.area());
     f.render_widget(Clear, area);
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1246,6 +1344,8 @@ fn render_add_form_modal(f: &mut ratatui::Frame, state: &AddTransactionState) {
         ]));
     }
 
+    let summary = add_summary_line(state, bold, dim);
+    content.push(summary);
     content.push(Line::raw(""));
 
     let field = |label: &str, buffer: &str| -> Line {
@@ -1272,7 +1372,7 @@ fn render_add_form_modal(f: &mut ratatui::Frame, state: &AddTransactionState) {
         Line::raw("  Tab: next field  j/k: pick account  Enter: preview  Esc: cancel").style(dim),
     );
 
-    let area = centered_rect(64, 16, f.area());
+    let area = centered_rect(64, 17, f.area());
     f.render_widget(Clear, area);
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1282,25 +1382,46 @@ fn render_add_form_modal(f: &mut ratatui::Frame, state: &AddTransactionState) {
     let paragraph = Paragraph::new(content).block(block);
     f.render_widget(paragraph, area);
 
-    // Put the terminal's own cursor right after the focused text so the
-    // input looks native. Layout: row 0 is the pane header, rows
-    // 1..=ADD_LIST_VISIBLE are the account lists, then a blank row, then
-    // the amount and memo fields. Text starts 2 cells in plus the
-    // 10-wide label column.
-    if matches!(state.focus, AddField::Amount | AddField::Memo) {
-        // Typed characters are single-width and the row indices are tiny;
-        // truncation from usize is not a real concern here.
-        #[allow(clippy::cast_possible_truncation)]
-        {
-            let (buffer, row) = if state.focus == AddField::Amount {
-                (&state.amount, ADD_LIST_VISIBLE + 2)
-            } else {
-                (&state.memo, ADD_LIST_VISIBLE + 3)
-            };
-            let typed_width = buffer.chars().count() as u16;
-            let x = (inner.x + 12 + typed_width).min(inner.right().saturating_sub(1));
-            f.set_cursor_position((x, inner.y + row as u16));
-        }
+    set_add_form_cursor(f, inner, state);
+}
+
+/// The `from → to` line showing the current selection under the panes.
+fn add_summary_line(state: &AddTransactionState, bold: Style, dim: Style) -> Line<'static> {
+    match (
+        state.accounts.get(state.from_index),
+        state.accounts.get(state.to_index),
+    ) {
+        (Some(from), Some(to)) => Line::from(vec![
+            Span::raw("  "),
+            Span::styled(from.as_str().to_string(), bold),
+            Span::styled("  →  ", dim),
+            Span::styled(to.as_str().to_string(), bold),
+        ]),
+        _ => Line::raw("  (no accounts)").style(dim),
+    }
+}
+
+/// Put the terminal's own cursor right after the focused text so the
+/// input looks native. Layout: row 0 is the pane header, rows 1 to
+/// `ADD_LIST_VISIBLE` are the account lists, then the summary row,
+/// a blank row, then the amount and memo fields. Text starts 2 cells
+/// in plus the 10-wide label column.
+fn set_add_form_cursor(f: &mut ratatui::Frame, inner: Rect, state: &AddTransactionState) {
+    if !matches!(state.focus, AddField::Amount | AddField::Memo) {
+        return;
+    }
+    // Typed characters are single-width and the row indices are tiny;
+    // truncation from usize is not a real concern here.
+    #[allow(clippy::cast_possible_truncation)]
+    {
+        let (buffer, row) = if state.focus == AddField::Amount {
+            (&state.amount, ADD_LIST_VISIBLE + 3)
+        } else {
+            (&state.memo, ADD_LIST_VISIBLE + 4)
+        };
+        let typed_width = buffer.chars().count() as u16;
+        let x = (inner.x + 12 + typed_width).min(inner.right().saturating_sub(1));
+        f.set_cursor_position((x, inner.y + row as u16));
     }
 }
 
@@ -1427,6 +1548,18 @@ mod tests {
         assert_eq!(clamp_offset(2, 5, 7), 2);
         assert_eq!(clamp_offset(9, 0, 7), 3);
         assert_eq!(clamp_offset(4, 3, 7), 3);
+    }
+
+    #[test]
+    fn money_formatting_groups_thousands() {
+        assert_eq!(fmt_money(Decimal::ZERO), "0.00");
+        assert_eq!(fmt_money(Decimal::from(60)), "60.00");
+        assert_eq!(fmt_money(Decimal::from_str("1543.51").unwrap()), "1,543.51");
+        assert_eq!(
+            fmt_money(Decimal::from_str("-1234567.89").unwrap()),
+            "-1,234,567.89"
+        );
+        assert_eq!(group_money("+1234567.89"), "+1,234,567.89");
     }
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -1618,6 +1751,28 @@ mod tests {
         assert!(
             text.contains("memo: Dues"),
             "memo missing in preview: {text}"
+        );
+        assert!(
+            text.contains("(income)"),
+            "class suffix truncated in preview: {text}"
+        );
+        assert!(
+            text.contains("Posts today ("),
+            "dated footer missing in preview: {text}"
+        );
+    }
+
+    #[test]
+    fn render_empty_states() {
+        let mut app = seeded_app();
+        app.search = "zzz".to_string();
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal.draw(|f| ui(f, &mut app)).expect("renders");
+        let text = buffer_text(&terminal);
+        assert!(
+            text.contains("no accounts match the current filters"),
+            "accounts empty state missing: {text}"
         );
     }
 

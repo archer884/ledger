@@ -95,7 +95,7 @@ pub struct TransactionId(pub Ulid);
 impl TransactionId {
     #[must_use]
     pub fn new() -> Self {
-        Self(Ulid::new())
+        Self(Ulid::generate())
     }
 }
 
