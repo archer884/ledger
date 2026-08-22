@@ -52,6 +52,24 @@ Two entries minimum per transaction, and the amounts must sum to zero. The model
 
 Press `?` in the TUI to open a dialog listing every shortcut, grouped by what they do. The status line at the bottom of the TUI is intentionally terse; the dialog is the reference.
 
+### Reading the TUI
+
+Amounts are colored by their literal sign — green for up, red for down — so an income account shows red, since its balance is the contra-side of money you earned. Colors are ANSI-indexed rather than fixed RGB, so your terminal's own palette decides the exact shades.
+
+The accounts view keeps a summary panel pinned to the bottom:
+
+```
+╭ Summary ────────────────────────────────────── activity all time ╮
+│  assets                   1,234.56  income               2,000.00│
+│  liabilities                  0.00  expenses              -765.44│
+│  net worth                1,234.56  net                  1,234.56│
+╰──────────────────────────────────────────────────────────────────╯
+```
+
+The left column is your position and the right column is the period's activity; each column adds up on its own. "Activity" covers everything since the last `ledger close` — income and expense accounts are zeroed by a close, so the panel says `since YYYY-MM-DD` once you have closed a year, and `all time` until then.
+
+The panel always totals every account, even while a search filter is active (it says "all accounts" when it is), because a net worth computed over some arbitrary subset of accounts isn't a number that means anything. It hides itself on a short terminal so the account list keeps its rows.
+
 ## Reconstructing transactions
 
 For a single transaction, the TUI's `y` key copies the `ledger add` command that would recreate the selected row to your clipboard. On the CLI, `ledger reconstruct <TX_ID>` prints the same thing to stdout.

@@ -48,6 +48,7 @@ If you find yourself importing `rusqlite` from `cli.rs` or `ratatui` from `stora
 - **No comments unless asked.** Doc comments on public items are fine and clippy pedantic will ask for them on `Result`-returning functions. Inline narrative comments get removed.
 - **Pedantic clippy is the bar.** `cargo clippy --all-targets -- -W clippy::pedantic` should pass clean. If you can't satisfy a lint, add a `#[allow(...)]` with a one-line explanation at the most local scope possible.
 - **Account ids normalize to ASCII alphanumeric + `/`.** `is_ascii_alphanumeric()` is the predicate in `model.rs`. Colons and dots are reserved (don't allow them in account names). The CLI entry format is `id:class:amount`, which is why `:` is reserved.
+- **Roll-ups belong in `model.rs`.** `Summary::from_balances` is the one place that turns per-account balances into book-level totals; it flips income to a positive magnitude and leaves liabilities negative so each reported column sums on its own. If you need another aggregate, put it there rather than in a render function — the identity `net_worth() + equity == net_income()` is testable without a terminal.
 - **Amounts are signed.** Positive means "the account went up by this much", negative means "down". A `+1000` entry on `checking` and a `-1000` entry on `income` are the two sides of a paycheck.
 
 ## DB schema (storage.rs)
@@ -67,6 +68,12 @@ entries(transaction_id TEXT FK→transactions, account TEXT FK→accounts, amoun
 `ratatui` + `crossterm`. The app loads all data into memory on startup; for a personal ledger this is fine. If you add pagination or lazy loading, the natural seam is `App::load()`.
 
 The render path is: `ui()` builds a `Table` widget from filtered data, hands it `&mut app.table_state` for selection. Column widths are `Constraint::Length(N)`; right-aligned columns use `Text::from(...).right_aligned()`.
+
+**Theme:** colors come from the `ACCENT` / `POSITIVE` / `NEGATIVE` consts at the top of `tui.rs`, always through the `accent()`, `heading()`, `dim()`, and `money_style()` helpers — don't hand-roll a `Style` with a literal color. They are ANSI-indexed (`Color::Cyan`, not `Color::Rgb`) so the user's terminal theme still picks the actual hue; keep it that way. Accent is chrome only (titles, table headers, cursor, modal borders, active filters). Money is colored by the *literal* sign of the amount, so an income account reads red — that is the signed convention showing through, not a bug; don't "fix" it by coloring per account class.
+
+The selection cursor is an accent bar (`cursor_symbol()`) plus a bold row, deliberately *not* `Modifier::REVERSED`. `Table::render_rows` patches `row_highlight_style` over the cells after they render, so REVERSED would swap the money column's green/red foreground into a background and paint the selected row in blocks of color.
+
+The accounts view reserves its bottom 5 rows for the summary panel (`render_summary`), which totals `model::Summary` across **every** account — it deliberately ignores the search filter, because net worth over an arbitrary subset is meaningless; the block title says "all accounts" while a filter is active. `split_body` drops the panel entirely when the body is under `SUMMARY_MIN_BODY` rows so a short terminal keeps usable table rows, and the register view never shows it. The "activity since" label comes from the last `model::detect_closes` result, computed once in `App::load()` rather than per frame.
 
 The terminal is restored in a guard pattern inside `tui::run()` — the closure captures the terminal so `restore_terminal` runs even if `App::new` or the event loop errors.
 

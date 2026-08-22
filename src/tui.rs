@@ -13,7 +13,7 @@ use jiff::tz::TimeZone;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
     Block, BorderType, Borders, Cell, Clear, Paragraph, Row, Table, TableState,
@@ -21,7 +21,9 @@ use ratatui::widgets::{
 use rust_decimal::Decimal;
 use thiserror::Error;
 
-use crate::model::{Account, AccountClass, AccountId, Entry, Transaction, TransactionId};
+use crate::model::{
+    Account, AccountClass, AccountId, Entry, Summary, Transaction, TransactionId, detect_closes,
+};
 use crate::storage::{Storage, StorageError};
 
 #[derive(Debug, Error)]
@@ -30,6 +32,41 @@ pub enum TuiError {
     Io(#[from] io::Error),
     #[error("storage: {0}")]
     Storage(#[from] StorageError),
+}
+
+const ACCENT: Color = Color::Cyan;
+const POSITIVE: Color = Color::Green;
+const NEGATIVE: Color = Color::Red;
+
+/// Three totals plus the surrounding border.
+const SUMMARY_HEIGHT: u16 = 5;
+/// Below this the summary is dropped so the table keeps usable rows.
+const SUMMARY_MIN_BODY: u16 = 9;
+/// Width reserved for the money column on each side of the summary.
+const SUMMARY_AMOUNT_WIDTH: usize = 14;
+
+fn dim() -> Style {
+    Style::default().add_modifier(Modifier::DIM)
+}
+
+fn accent() -> Style {
+    Style::default().fg(ACCENT)
+}
+
+fn heading() -> Style {
+    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+}
+
+fn money_style(amount: Decimal) -> Style {
+    match amount.cmp(&Decimal::ZERO) {
+        std::cmp::Ordering::Greater => Style::default().fg(POSITIVE),
+        std::cmp::Ordering::Less => Style::default().fg(NEGATIVE),
+        std::cmp::Ordering::Equal => dim(),
+    }
+}
+
+fn money_cell(amount: Decimal) -> Cell<'static> {
+    Cell::from(Text::from(fmt_money(amount)).right_aligned()).style(money_style(amount))
 }
 
 enum View {
@@ -112,6 +149,7 @@ struct App {
     edit_accounts: Option<EditAccountsState>,
     add_transaction: Option<AddTransactionState>,
     reconstruct_cmd: Option<String>,
+    activity_since: Option<Timestamp>,
 }
 
 impl App {
@@ -131,6 +169,7 @@ impl App {
             edit_accounts: None,
             add_transaction: None,
             reconstruct_cmd: None,
+            activity_since: None,
         };
         app.load()?;
         app.reset_cursor();
@@ -151,9 +190,28 @@ impl App {
             .collect();
         with_balances.sort_by(|a, b| a.0.id.as_str().cmp(b.0.id.as_str()));
 
+        let classes: HashMap<AccountId, AccountClass> = with_balances
+            .iter()
+            .map(|(a, _)| (a.id.clone(), a.class))
+            .collect();
+        self.activity_since = detect_closes(&transactions, &classes)
+            .last()
+            .map(|close| close.posted_at);
+
         self.accounts_with_balances = with_balances;
         self.transactions = transactions;
         Ok(())
+    }
+
+    /// Book-level totals. Deliberately ignores the search filter: a net
+    /// worth computed over an arbitrary subset of accounts is not a
+    /// meaningful number.
+    fn summary(&self) -> Summary {
+        Summary::from_balances(
+            self.accounts_with_balances
+                .iter()
+                .map(|(a, balance)| (a.class, *balance)),
+        )
     }
 
     fn reload(&mut self) {
@@ -468,23 +526,25 @@ impl App {
     }
 
     fn status_line(&self) -> Line<'static> {
-        let dim = Style::default().add_modifier(Modifier::DIM);
         match self.input_mode {
             InputMode::Normal => {
                 let mut spans: Vec<Span<'static>> = Vec::new();
                 if !self.search.is_empty() {
-                    spans.push(Span::raw(format!("/{} ", self.search)));
+                    spans.push(Span::styled(format!("/{} ", self.search), accent()));
                 }
                 if let Some(from) = self.date_from {
-                    spans.push(Span::raw(format!("from:{} ", format_date(from))));
+                    spans.push(Span::styled(
+                        format!("from:{} ", format_date(from)),
+                        accent(),
+                    ));
                 }
                 if let Some(to) = self.date_to {
-                    spans.push(Span::raw(format!("to:{} ", format_date(to))));
+                    spans.push(Span::styled(format!("to:{} ", format_date(to)), accent()));
                 }
                 if !self.status.is_empty() {
                     spans.push(Span::raw(format!("[{}] ", self.status)));
                 }
-                spans.push(Span::styled("?: help  q: quit", dim));
+                spans.push(Span::styled("?: help  q: quit", dim()));
                 Line::from(spans)
             }
             InputMode::Search => Line::raw(format!(
@@ -997,16 +1057,14 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
         .split(f.area());
 
     let title = match &app.view {
-        View::Accounts => "ledger".to_string(),
-        View::Register { account } => format!("ledger > {account}"),
+        View::Accounts => Line::from(Span::styled("ledger", heading())),
+        View::Register { account } => Line::from(vec![
+            Span::styled("ledger", dim()),
+            Span::styled(" \u{203a} ", dim()),
+            Span::styled(account.to_string(), heading()),
+        ]),
     };
-    f.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            title,
-            Style::default().add_modifier(Modifier::BOLD),
-        ))),
-        chunks[0],
-    );
+    f.render_widget(Paragraph::new(title), chunks[0]);
 
     let empty_msg: Option<String> = match &app.view {
         View::Accounts => {
@@ -1037,14 +1095,20 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
         }
     };
 
+    let (list_area, summary_area) = split_body(chunks[1], &app.view);
+
     if let Some(msg) = empty_msg {
-        render_empty_state(f, chunks[1], &msg);
+        render_empty_state(f, list_area, &msg);
     } else {
         let table = match &app.view {
             View::Accounts => accounts_table(app),
             View::Register { account } => register_table(app, account),
         };
-        f.render_stateful_widget(table, chunks[1], &mut app.table_state);
+        f.render_stateful_widget(table, list_area, &mut app.table_state);
+    }
+
+    if let Some(area) = summary_area {
+        render_summary(f, app, area);
     }
 
     let status = app.status_line();
@@ -1075,22 +1139,17 @@ fn accounts_table(app: &App) -> Table<'static> {
         Cell::from("account"),
         Cell::from(Text::from("balance").right_aligned()),
     ])
-    .style(Style::default().add_modifier(Modifier::BOLD));
+    .style(heading());
     let rows: Vec<Row> = app
         .filtered_accounts()
         .iter()
-        .map(|(a, b)| {
-            Row::new(vec![
-                Cell::from(a.id.to_string()),
-                Cell::from(Text::from(fmt_money(*b)).right_aligned()),
-            ])
-        })
+        .map(|(a, b)| Row::new(vec![Cell::from(a.id.to_string()), money_cell(*b)]))
         .collect();
     Table::new(rows, [Constraint::Length(32), Constraint::Length(14)])
         .header(header)
         .column_spacing(2)
-        .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED))
-        .highlight_symbol("> ")
+        .row_highlight_style(selected_row_style())
+        .highlight_symbol(cursor_symbol())
 }
 
 fn register_table(app: &App, account: &AccountId) -> Table<'static> {
@@ -1099,7 +1158,7 @@ fn register_table(app: &App, account: &AccountId) -> Table<'static> {
         Cell::from("memo"),
         Cell::from(Text::from("amount").right_aligned()),
     ])
-    .style(Style::default().add_modifier(Modifier::BOLD));
+    .style(heading());
     let rows: Vec<Row> = app
         .filtered_transactions()
         .iter()
@@ -1112,7 +1171,7 @@ fn register_table(app: &App, account: &AccountId) -> Table<'static> {
             Row::new(vec![
                 Cell::from(format_date(tx.posted_at)),
                 Cell::from(tx.memo.clone()),
-                Cell::from(Text::from(fmt_money(amount)).right_aligned()),
+                money_cell(amount),
             ])
         })
         .collect();
@@ -1126,8 +1185,99 @@ fn register_table(app: &App, account: &AccountId) -> Table<'static> {
     )
     .header(header)
     .column_spacing(2)
-    .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED))
-    .highlight_symbol("> ")
+    .row_highlight_style(selected_row_style())
+    .highlight_symbol(cursor_symbol())
+}
+
+/// The cursor is an accent bar rather than a reversed row so the
+/// green/red on the money columns survives the selection. `row_highlight_style`
+/// is patched over the cells after they render, so anything it sets wins.
+fn cursor_symbol() -> Span<'static> {
+    Span::styled("\u{258c} ", accent())
+}
+
+fn selected_row_style() -> Style {
+    Style::default().add_modifier(Modifier::BOLD)
+}
+
+/// Reserve the bottom of the accounts view for the summary, but only when
+/// there is enough room left for the table to stay useful.
+fn split_body(area: Rect, view: &View) -> (Rect, Option<Rect>) {
+    if !matches!(view, View::Accounts) || area.height < SUMMARY_MIN_BODY {
+        return (area, None);
+    }
+    let split = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(SUMMARY_HEIGHT)])
+        .split(area);
+    (split[0], Some(split[1]))
+}
+
+/// One `label ........ amount` pair filling half the summary's inner width.
+fn summary_pair(half: usize, label: &str, amount: Decimal, emphasis: bool) -> Vec<Span<'static>> {
+    let label_width = half.saturating_sub(2 + SUMMARY_AMOUNT_WIDTH);
+    let label_style = if emphasis { heading() } else { dim() };
+    let amount_style = if emphasis {
+        money_style(amount).add_modifier(Modifier::BOLD)
+    } else {
+        money_style(amount)
+    };
+    vec![
+        Span::raw("  "),
+        Span::styled(format!("{label:<label_width$.label_width$}"), label_style),
+        Span::styled(
+            format!("{:>SUMMARY_AMOUNT_WIDTH$}", fmt_money(amount)),
+            amount_style,
+        ),
+    ]
+}
+
+fn render_summary(f: &mut ratatui::Frame, app: &App, area: Rect) {
+    let summary = app.summary();
+    let period = app.activity_since.map_or_else(
+        || "all time".to_string(),
+        |since| format!("since {}", format_date(since)),
+    );
+    let title = if app.search.is_empty() {
+        " Summary ".to_string()
+    } else {
+        " Summary (all accounts) ".to_string()
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(accent())
+        .title(Span::styled(title, heading()))
+        .title_top(Line::from(Span::styled(format!(" activity {period} "), dim())).right_aligned());
+
+    let inner = block.inner(area);
+    let half = (inner.width as usize) / 2;
+
+    let row = |left: (&str, Decimal), right: (&str, Decimal), emphasis: bool| -> Line<'static> {
+        let mut spans = summary_pair(half, left.0, left.1, emphasis);
+        spans.extend(summary_pair(half, right.0, right.1, emphasis));
+        Line::from(spans)
+    };
+
+    let content = vec![
+        row(
+            ("assets", summary.assets),
+            ("income", summary.income),
+            false,
+        ),
+        row(
+            ("liabilities", summary.liabilities),
+            ("expenses", -summary.expenses),
+            false,
+        ),
+        row(
+            ("net worth", summary.net_worth()),
+            ("net", summary.net_income()),
+            true,
+        ),
+    ];
+
+    f.render_widget(Paragraph::new(content).block(block), area);
 }
 
 fn render_empty_state(f: &mut ratatui::Frame, area: Rect, msg: &str) {
@@ -1139,7 +1289,7 @@ fn render_empty_state(f: &mut ratatui::Frame, area: Rect, msg: &str) {
             Constraint::Min(0),
         ])
         .split(area);
-    let text = Line::raw(msg.to_string()).style(Style::default().add_modifier(Modifier::DIM));
+    let text = Line::raw(msg.to_string()).style(dim());
     f.render_widget(
         Paragraph::new(text).alignment(Alignment::Center),
         vertical[1],
@@ -1172,6 +1322,8 @@ fn render_delete_confirm(f: &mut ratatui::Frame) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
+        .border_style(accent())
+        .title_style(heading())
         .title("Delete transaction");
     let paragraph = Paragraph::new("Delete this transaction? (y/n)").block(block);
     f.render_widget(paragraph, area);
@@ -1198,6 +1350,8 @@ fn render_edit_accounts_modal(f: &mut ratatui::Frame, app: &App) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
+        .border_style(accent())
+        .title_style(heading())
         .title(title);
 
     let rows: Vec<Line> = state
@@ -1211,7 +1365,7 @@ fn render_edit_accounts_modal(f: &mut ratatui::Frame, app: &App) {
             let amount_label = format!("{:>14.2}", entry.amount);
             let line = Line::from(vec![
                 Span::raw(account_label),
-                Span::styled(amount_label, Style::default().add_modifier(Modifier::DIM)),
+                Span::styled(amount_label, money_style(entry.amount)),
             ]);
             if selected {
                 line.style(Style::default().add_modifier(Modifier::REVERSED))
@@ -1226,9 +1380,7 @@ fn render_edit_accounts_modal(f: &mut ratatui::Frame, app: &App) {
     let content: Vec<Line> = rows
         .into_iter()
         .chain(std::iter::once(Line::raw("  ")))
-        .chain(std::iter::once(
-            Line::raw(help).style(Style::default().add_modifier(Modifier::DIM)),
-        ))
+        .chain(std::iter::once(Line::raw(help).style(dim())))
         .collect();
 
     let paragraph = Paragraph::new(content).block(block);
@@ -1255,10 +1407,11 @@ fn render_add_confirm_modal(f: &mut ratatui::Frame, app: &App, state: &AddTransa
             .to_lowercase();
         content.push(Line::from(vec![
             Span::raw(format!("  {:<24}", entry.account.to_string())),
-            Span::raw(format!(
-                "{:>12}{class}",
-                group_money(&format!("{:+.2}", entry.amount))
-            )),
+            Span::styled(
+                format!("{:>12}", group_money(&format!("{:+.2}", entry.amount))),
+                money_style(entry.amount),
+            ),
+            Span::styled(class, dim()),
         ]));
     }
     if !state.memo.is_empty() {
@@ -1270,20 +1423,21 @@ fn render_add_confirm_modal(f: &mut ratatui::Frame, app: &App, state: &AddTransa
             "  Posts today ({})",
             format_date(today_timestamp())
         ))
-        .style(Style::default().add_modifier(Modifier::DIM)),
+        .style(dim()),
     );
     let area = centered_rect(58, 8, f.area());
     f.render_widget(Clear, area);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
+        .border_style(accent())
+        .title_style(heading())
         .title("Add transaction — Save? (y/n)");
     let paragraph = Paragraph::new(content).block(block);
     f.render_widget(paragraph, area);
 }
 
 fn render_add_form_modal(f: &mut ratatui::Frame, state: &AddTransactionState) {
-    let dim = Style::default().add_modifier(Modifier::DIM);
     let bold = Style::default().add_modifier(Modifier::BOLD);
     let reversed = Style::default().add_modifier(Modifier::REVERSED);
 
@@ -1335,26 +1489,26 @@ fn render_add_form_modal(f: &mut ratatui::Frame, state: &AddTransactionState) {
             .map_or((String::new(), false), |(s, hot)| ((*s).clone(), *hot));
         content.push(Line::from(vec![
             Span::raw("  "),
-            Span::styled(format!("{left:<28}"), if left_hot { reversed } else { dim }),
+            Span::styled(
+                format!("{left:<28}"),
+                if left_hot { reversed } else { dim() },
+            ),
             Span::raw("  "),
             Span::styled(
                 format!("{right:<28}"),
-                if right_hot { reversed } else { dim },
+                if right_hot { reversed } else { dim() },
             ),
         ]));
     }
 
-    let summary = add_summary_line(state, bold, dim);
+    let summary = add_summary_line(state, bold, dim());
     content.push(summary);
     content.push(Line::raw(""));
 
     let field = |label: &str, buffer: &str| -> Line {
         Line::from(vec![
             Span::raw("  "),
-            Span::styled(
-                format!("{label:<10}"),
-                Style::default().add_modifier(Modifier::DIM),
-            ),
+            Span::styled(format!("{label:<10}"), dim()),
             Span::raw(buffer.to_string()),
         ])
     };
@@ -1369,7 +1523,7 @@ fn render_add_form_modal(f: &mut ratatui::Frame, state: &AddTransactionState) {
         content.push(Line::raw(""));
     }
     content.push(
-        Line::raw("  Tab: next field  j/k: pick account  Enter: preview  Esc: cancel").style(dim),
+        Line::raw("  Tab: next field  j/k: pick account  Enter: preview  Esc: cancel").style(dim()),
     );
 
     let area = centered_rect(64, 17, f.area());
@@ -1377,6 +1531,8 @@ fn render_add_form_modal(f: &mut ratatui::Frame, state: &AddTransactionState) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
+        .border_style(accent())
+        .title_style(heading())
         .title("Add transaction");
     let inner = block.inner(area);
     let paragraph = Paragraph::new(content).block(block);
@@ -1440,9 +1596,10 @@ fn render_reconstruct_modal(f: &mut ratatui::Frame, app: &App) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
+        .border_style(accent())
+        .title_style(heading())
         .title("ledger add command (clipboard unavailable — any key to close)");
-    let help = Line::raw("  copy from your terminal selection")
-        .style(Style::default().add_modifier(Modifier::DIM));
+    let help = Line::raw("  copy from your terminal selection").style(dim());
     let content: Vec<Line> = lines
         .into_iter()
         .chain(std::iter::once(Line::raw("")))
@@ -1454,11 +1611,11 @@ fn render_reconstruct_modal(f: &mut ratatui::Frame, app: &App) {
 
 fn render_help_modal(f: &mut ratatui::Frame) {
     fn header(s: &str) -> Line<'static> {
-        Line::from(s.to_string()).style(Style::default().add_modifier(Modifier::BOLD))
+        Line::from(s.to_string()).style(heading())
     }
     fn row(keys: &str, desc: &str) -> Line<'static> {
         Line::from(vec![
-            Span::raw(format!("  {keys:<18}")),
+            Span::styled(format!("  {keys:<18}"), accent()),
             Span::raw(desc.to_string()),
         ])
     }
@@ -1491,6 +1648,8 @@ fn render_help_modal(f: &mut ratatui::Frame) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
+        .border_style(accent())
+        .title_style(heading())
         .title("Keyboard shortcuts (any key to close)");
     let paragraph = Paragraph::new(content).block(block);
     f.render_widget(paragraph, area);
@@ -1760,6 +1919,216 @@ mod tests {
             text.contains("Posts today ("),
             "dated footer missing in preview: {text}"
         );
+    }
+
+    /// `seeded_app` plus a paycheck and a bill, so the summary has
+    /// something to add up: assets 1,234.56, income 2,000, expenses 765.44.
+    fn app_with_activity() -> App {
+        let app = seeded_app();
+        for (memo, entries) in [
+            ("Dues", vec![("income/dues", "-2000"), ("general", "2000")]),
+            (
+                "City",
+                vec![("general", "-765.44"), ("expense/city", "765.44")],
+            ),
+        ] {
+            let entries = entries
+                .into_iter()
+                .map(|(account, amount)| Entry {
+                    account: acct_id(account),
+                    amount: Decimal::from_str(amount).expect("amount parses"),
+                })
+                .collect();
+            let tx = Transaction::new(
+                TransactionId::new(),
+                today_timestamp(),
+                memo.to_string(),
+                entries,
+            )
+            .expect("tx balances");
+            app.storage.save_transaction(&tx).expect("saved");
+        }
+        let mut app = app;
+        app.load().expect("reloads");
+        app
+    }
+
+    fn render_at(app: &mut App, width: u16, height: u16) -> String {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal.draw(|f| ui(f, app)).expect("renders");
+        buffer_text(&terminal)
+    }
+
+    #[test]
+    fn summary_totals_the_whole_book() {
+        let app = app_with_activity();
+        let summary = app.summary();
+        assert_eq!(summary.assets, Decimal::from_str("1234.56").unwrap());
+        assert_eq!(summary.income, Decimal::from(2000));
+        assert_eq!(summary.expenses, Decimal::from_str("765.44").unwrap());
+        assert_eq!(summary.net_worth(), Decimal::from_str("1234.56").unwrap());
+        assert_eq!(summary.net_income(), Decimal::from_str("1234.56").unwrap());
+    }
+
+    #[test]
+    fn render_summary_panel_shows_both_columns() {
+        let mut app = app_with_activity();
+        let text = render_at(&mut app, 80, 24);
+        for needle in [
+            "Summary",
+            "assets",
+            "liabilities",
+            "net worth",
+            "income",
+            "expenses",
+            "1,234.56",
+            "2,000.00",
+            "-765.44",
+        ] {
+            assert!(text.contains(needle), "{needle:?} missing from: {text}");
+        }
+    }
+
+    /// With no close in the history the nominal balances are all-time.
+    #[test]
+    fn render_summary_labels_the_activity_period() {
+        let mut app = app_with_activity();
+        assert!(app.activity_since.is_none());
+        let text = render_at(&mut app, 80, 24);
+        assert!(text.contains("activity all time"), "period missing: {text}");
+    }
+
+    /// Net worth over a filtered subset is not a meaningful number, so the
+    /// panel keeps totalling every account and says so.
+    #[test]
+    fn render_summary_ignores_the_search_filter() {
+        let mut app = app_with_activity();
+        app.search = "expense".to_string();
+        let text = render_at(&mut app, 80, 24);
+        assert!(
+            text.contains("all accounts"),
+            "filter disclaimer missing: {text}"
+        );
+        assert!(text.contains("1,234.56"), "totals changed: {text}");
+    }
+
+    #[test]
+    fn render_summary_is_absent_from_the_register() {
+        let mut app = app_with_activity();
+        assert!(render_at(&mut app, 80, 24).contains("net worth"));
+
+        handle_key(&mut app, key(KeyCode::Enter));
+        assert!(matches!(app.view, View::Register { .. }));
+        let text = render_at(&mut app, 80, 24);
+        assert!(!text.contains("net worth"), "summary leaked: {text}");
+    }
+
+    /// A short terminal gives its rows to the table instead.
+    #[test]
+    fn render_summary_yields_to_a_short_terminal() {
+        let mut app = app_with_activity();
+        let text = render_at(&mut app, 80, 8);
+        assert!(
+            !text.contains("net worth"),
+            "summary crowded out rows: {text}"
+        );
+        assert!(text.contains("expense/city"), "table missing: {text}");
+    }
+
+    #[test]
+    fn render_summary_survives_a_narrow_terminal() {
+        let mut app = app_with_activity();
+        render_at(&mut app, 4, 24);
+    }
+
+    /// Once a close is on the books the nominal balances only cover the
+    /// period since it, and the panel dates them accordingly.
+    #[test]
+    fn render_summary_dates_activity_from_the_last_close() {
+        let mut app = app_with_activity();
+        app.storage
+            .register_account(&Account {
+                id: acct_id("equity/net"),
+                class: AccountClass::Equity,
+            })
+            .expect("registered");
+        let close = Transaction::new(
+            TransactionId::new(),
+            today_timestamp(),
+            "FY close".to_string(),
+            vec![
+                Entry {
+                    account: acct_id("income/dues"),
+                    amount: Decimal::from(2000),
+                },
+                Entry {
+                    account: acct_id("expense/city"),
+                    amount: Decimal::from_str("-765.44").unwrap(),
+                },
+                Entry {
+                    account: acct_id("equity/net"),
+                    amount: Decimal::from_str("-1234.56").unwrap(),
+                },
+            ],
+        )
+        .expect("tx balances");
+        app.storage.save_transaction(&close).expect("saved");
+        app.load().expect("reloads");
+
+        assert!(app.activity_since.is_some(), "close not detected");
+        let summary = app.summary();
+        assert_eq!(summary.net_income(), Decimal::ZERO, "nominals not zeroed");
+        assert_eq!(
+            summary.net_worth(),
+            Decimal::from_str("1234.56").unwrap(),
+            "a close must not move net worth"
+        );
+
+        let text = render_at(&mut app, 80, 24);
+        assert!(
+            text.contains(&format!(
+                "activity since {}",
+                format_date(today_timestamp())
+            )),
+            "close date missing: {text}"
+        );
+    }
+
+    /// Foreground color of the balance column on a given table row.
+    fn balance_fg(app: &mut App, row: u16) -> Color {
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal.draw(|f| ui(f, app)).expect("renders");
+        let buffer = terminal.backend().buffer();
+        (36..50)
+            .filter_map(|x| buffer.cell(ratatui::layout::Position::new(x, row)))
+            .find(|c| c.symbol() != " ")
+            .expect("balance column has text")
+            .fg
+    }
+
+    /// Accounts sort to expense/city(+765.44), general(+1234.56),
+    /// income/dues(-2000); the table starts on row 2 under title and header.
+    #[test]
+    fn balances_are_colored_by_sign() {
+        let mut app = app_with_activity();
+        assert_eq!(balance_fg(&mut app, 3), POSITIVE, "general should be green");
+        assert_eq!(
+            balance_fg(&mut app, 4),
+            NEGATIVE,
+            "income/dues should be red"
+        );
+    }
+
+    /// The reason the cursor is an accent bar rather than a reversed row:
+    /// `row_highlight_style` is patched over the cells, so REVERSED would
+    /// repaint the money column's foreground into a background.
+    #[test]
+    fn selected_row_keeps_its_money_color() {
+        let mut app = app_with_activity();
+        app.table_state.select(Some(2));
+        assert_eq!(balance_fg(&mut app, 4), NEGATIVE);
     }
 
     #[test]

@@ -342,6 +342,52 @@ pub fn detect_closes(
     closes
 }
 
+/// Book-level totals rolled up from account balances.
+///
+/// Balances arrive in the ledger's signed convention (positive means the
+/// account went up) and leave in the one a reader expects: `income` and
+/// `expenses` are positive magnitudes, while `liabilities` stays negative
+/// while money is owed, so both reported columns sum on their own —
+/// `assets + liabilities == net_worth()`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Summary {
+    pub assets: Decimal,
+    pub liabilities: Decimal,
+    pub equity: Decimal,
+    pub income: Decimal,
+    pub expenses: Decimal,
+}
+
+impl Summary {
+    #[must_use]
+    pub fn from_balances<I>(balances: I) -> Self
+    where
+        I: IntoIterator<Item = (AccountClass, Decimal)>,
+    {
+        let mut summary = Self::default();
+        for (class, balance) in balances {
+            match class {
+                AccountClass::Asset => summary.assets += balance,
+                AccountClass::Liability => summary.liabilities += balance,
+                AccountClass::Equity => summary.equity += balance,
+                AccountClass::Income => summary.income -= balance,
+                AccountClass::Expense => summary.expenses += balance,
+            }
+        }
+        summary
+    }
+
+    #[must_use]
+    pub fn net_worth(&self) -> Decimal {
+        self.assets + self.liabilities
+    }
+
+    #[must_use]
+    pub fn net_income(&self) -> Decimal {
+        self.income - self.expenses
+    }
+}
+
 impl std::fmt::Display for ReconstructError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -414,6 +460,96 @@ mod tests {
             .iter()
             .map(|(id, class)| (AccountId::parse(id).expect("account parses"), *class))
             .collect()
+    }
+
+    fn dec(s: &str) -> Decimal {
+        Decimal::from_str(s).expect("amount parses")
+    }
+
+    /// A book mid-year: no close has happened yet, so equity is still zero
+    /// and every dollar of net income is sitting in the asset accounts.
+    fn open_book() -> Vec<(AccountClass, Decimal)> {
+        vec![
+            (AccountClass::Asset, dec("1500")),
+            (AccountClass::Liability, dec("-265.44")),
+            (AccountClass::Equity, dec("0")),
+            (AccountClass::Income, dec("-2000")),
+            (AccountClass::Expense, dec("765.44")),
+        ]
+    }
+
+    /// The same book after a prior year closed 1000 of net income into
+    /// `equity/net`, which the signed convention records as a negative.
+    fn closed_book() -> Vec<(AccountClass, Decimal)> {
+        vec![
+            (AccountClass::Asset, dec("2500")),
+            (AccountClass::Liability, dec("-265.44")),
+            (AccountClass::Equity, dec("-1000")),
+            (AccountClass::Income, dec("-2000")),
+            (AccountClass::Expense, dec("765.44")),
+        ]
+    }
+
+    #[test]
+    fn summary_reports_income_and_expenses_as_magnitudes() {
+        let summary = Summary::from_balances(open_book());
+        assert_eq!(summary.assets, dec("1500"));
+        assert_eq!(summary.liabilities, dec("-265.44"));
+        assert_eq!(summary.income, dec("2000"), "income flips to positive");
+        assert_eq!(summary.expenses, dec("765.44"), "expenses stay positive");
+        assert_eq!(summary.net_worth(), dec("1234.56"));
+        assert_eq!(summary.net_income(), dec("1234.56"));
+    }
+
+    #[test]
+    fn summary_sums_multiple_accounts_per_class() {
+        let summary = Summary::from_balances(vec![
+            (AccountClass::Asset, dec("1000")),
+            (AccountClass::Asset, dec("500")),
+            (AccountClass::Expense, dec("300")),
+            (AccountClass::Expense, dec("465.44")),
+        ]);
+        assert_eq!(summary.assets, dec("1500"));
+        assert_eq!(summary.expenses, dec("765.44"));
+    }
+
+    #[test]
+    fn summary_of_an_empty_book_is_all_zero() {
+        let summary = Summary::from_balances(vec![]);
+        assert_eq!(summary, Summary::default());
+        assert_eq!(summary.net_worth(), Decimal::ZERO);
+        assert_eq!(summary.net_income(), Decimal::ZERO);
+    }
+
+    /// The accounting identity, restated in the summary's terms: every
+    /// dollar of net worth is either this period's net income or a prior
+    /// period's, parked in equity by a close.
+    #[test]
+    fn summary_satisfies_the_accounting_identity() {
+        for balances in [open_book(), closed_book()] {
+            let summary = Summary::from_balances(balances);
+            assert_eq!(
+                summary.net_worth() + summary.equity,
+                summary.net_income(),
+                "identity broken for {summary:?}"
+            );
+        }
+    }
+
+    /// A close moves net income out of the nominal accounts and into
+    /// equity without touching net worth.
+    #[test]
+    fn summary_net_worth_survives_a_close() {
+        let before = Summary::from_balances(closed_book());
+        let after = Summary::from_balances(vec![
+            (AccountClass::Asset, dec("2500")),
+            (AccountClass::Liability, dec("-265.44")),
+            (AccountClass::Equity, dec("-2234.56")),
+            (AccountClass::Income, dec("0")),
+            (AccountClass::Expense, dec("0")),
+        ]);
+        assert_eq!(before.net_worth(), after.net_worth());
+        assert_eq!(after.net_income(), Decimal::ZERO);
     }
 
     #[test]
